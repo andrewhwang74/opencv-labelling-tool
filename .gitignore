@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# YOLO model weights (large binary files – download on first run)
+*.pt
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.webm
+
+# Annotation output (user-specific data)
+*_tracks.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
