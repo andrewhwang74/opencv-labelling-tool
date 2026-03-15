@@ -52,21 +52,20 @@ DEFAULT_MODE = 'person'   # fallback when YOLO class not in map
 # scope defaults to 'per_frame' if omitted.
 TRACK_STATES = {
     'person': [
-        ('movement',              ['walking', 'waiting', 'rushing', 're-routing'],              'per_frame'),
+        ('movement',              ['walking', 'waiting'],                                       'per_frame'),
         ('crosswalk position',    ['outside crosswalk', 'inside crosswalk'],                    'per_frame'),
-        ('distraction',           ['distacted', 'not distracted'],                              'per_frame'),
+        ('distraction',           ['not distracted', 'distacted'],                              'per_frame'),
         ('interaction',           ['no interaction', 'gesture', 'verbal', 'eye-contact'],       'per_frame'),
-        ('wait time',             ['just arrived', 'short wait', 'long wait'],                  'per_track'),
+        ('wait time',             ['just arrived', 'waited'],                                   'per_track'),
         ('start position',        ['near', 'far'],                                              'per_track'),
-        ('group size',            ['alone', 'with group'],                                      'per_track'),
-        ('carrying object',       ['no object', 'stroller', 'cart', 'other'],                   'per_track'),
+        ('carrying object',       ['no object', 'carrying object'],                             'per_track'),
     ],
     'vehicle': [
-        ('movement',              ['turning', 'waiting', 'straight'],                                           'per_frame'),
+        ('movement',              ['turning', 'waiting'],                                                       'per_frame'),
         ('position',              ['outside crosswalk', 'inside crosswalk'],                                    'per_frame'),
         ('interaction',           ['no interaction', 'honk', 'gap-find', 'gesture', 'verbal', 'eye-contact'],   'per_frame'),
         ('type',                  ['suv', 'truck', 'bus', 'sedan', 'van', 'pickup'],                            'per_track'),
-        ('wait time',             ['just arrived', 'short wait', 'long wait'],                                  'per_track'),
+        ('wait time',             ['just arrived', 'waited'],                                                   'per_track'),
     ],
 }
 
@@ -92,9 +91,18 @@ VK_SHIFT = 0x10   # GetAsyncKeyState virtual-key code for Shift
 
 SCRUB_STEP = 1
 
+# Performance tuning
+DETECT_CLASS_IDS      = [0, 2, 5, 7]  # person, car, bus, truck (COCO IDs)
+TRACK_INFER_IMGSZ     = 512            # smaller input => faster inference
+TRACK_INFER_EVERY_N   = 2              # run model every N playback frames while locked
+PLAYBACK_SKIP_FRAMES  = 1              # extra frames grabbed (not decoded) during playback
+FAST_PLAY_WAIT_MS     = 1              # minimum wait while playing
+
 TRACK_COLOR   = (0, 220, 255)   # cyan   – live tracked object
 HISTORY_COLOR = (80, 150, 255)  # blue   – historical (seeked-to) box
 DIM_COLOR     = (160, 160, 160) # grey   – "showing all" fallback detections
+POLY_COLOR    = (0, 255, 255)   # yellow – crosswalk polygon
+POLY_TMP_COLOR= (0, 180, 255)   # orange – in-progress polygon
 
 # Shared mutable state (written by mouse callback, read by main loop)
 _state = {
@@ -216,6 +224,41 @@ def _default_track_states(mode):
     return {e[0]: e[1][0] for e in _ordered_state_cats(mode)}
 
 
+def build_person_path_points(track_dict):
+    """Return sorted [(frame_num, mid_x, bottom_y)] for person frames in a track."""
+    pts = []
+    for f in track_dict.get("frames", []):
+        fmode = f.get("mode", track_dict.get("mode", DEFAULT_MODE))
+        if fmode != "person":
+            continue
+        x1, y1, x2, y2 = f.get("box", [0, 0, 0, 0])
+        pts.append((int(f.get("frame_num", 0)), float((x1 + x2) / 2.0), float(y2)))
+    pts.sort(key=lambda t: t[0])
+    return pts
+
+
+def draw_smooth_polyline(canvas, frame_pts, x_off, y_off, scale, color, thickness=2):
+    """Draw anti-aliased smoothed polyline through frame-space points."""
+    if len(frame_pts) < 2:
+        return
+    arr = np.array([
+        [x_off + p[0] * scale, y_off + p[1] * scale]
+        for p in frame_pts
+    ], dtype=np.float32)
+
+    # Moving-average smoothing to reduce jitter from bbox edges.
+    if len(arr) >= 3:
+        sm = arr.copy()
+        rad = 2
+        for i in range(len(arr)):
+            a = max(0, i - rad)
+            b = min(len(arr), i + rad + 1)
+            sm[i] = arr[a:b].mean(axis=0)
+        arr = sm
+
+    cv2.polylines(canvas, [arr.astype(np.int32)], False, color, thickness, cv2.LINE_AA)
+
+
 def draw_popup(canvas, anchor_x, anchor_y, track_mode, track_states, screen_w, screen_h):
     """Compact popup: one toggle row per annotation item (no headers/lists).
 
@@ -287,7 +330,7 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
       [SIDEBAR_W px wide]  |  [video area – top 90%]
       [full-width timeline –  bottom 10%]
     boxes         – current-track boxes: (x1,y1,x2,y2,label,color).
-    preview_boxes – saved-track boxes:   (x1,y1,x2,y2,label,color,ann_str).
+    preview_boxes – saved-track boxes:   (x1,y1,x2,y2,label,color,ann_lines,traj_points).
     canvas_meta   – dict with display flags.
     """
     if canvas_meta is None:
@@ -499,6 +542,7 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         ("[drag] draw box",      (210, 210, 50)),
         ("[<][>] frame step",    (140, 140, 140)),
         ("[SPACE] play/pause",   (140, 140, 140)),
+        ("[Z] 4x speed",         (140, 140, 140)),
         ("[Q/ESC] quit",         (140, 140, 140)),
     ]
     for htxt, hcol in hints:
@@ -519,6 +563,25 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
     # Update shared layout for back-projection in canvas_to_frame()
     _layout.update({"x_off": x_off, "y_off": y_off,
                     "new_w": new_w, "new_h": new_h, "scale": scale})
+
+    # --- crosswalk polygon (always shown when present) ---
+    polygon_points = canvas_meta.get("polygon_points", [])
+    if polygon_points:
+        p_canvas = [(int(x_off + px * scale), int(y_off + py * scale))
+                    for (px, py) in polygon_points]
+        if len(p_canvas) >= 2:
+            draw_col = POLY_COLOR if len(p_canvas) == 4 else POLY_TMP_COLOR
+            for i in range(len(p_canvas) - 1):
+                cv2.line(canvas, p_canvas[i], p_canvas[i + 1], draw_col, 2, cv2.LINE_AA)
+            if len(p_canvas) == 4:
+                cv2.line(canvas, p_canvas[-1], p_canvas[0], POLY_COLOR, 2, cv2.LINE_AA)
+        for p in p_canvas:
+            cv2.circle(canvas, p, 4, POLY_COLOR, -1, cv2.LINE_AA)
+
+    if canvas_meta.get("polygon_setup", False):
+        hint = "Crosswalk setup: click 4 points, Enter=confirm, Backspace=clear"
+        cv2.putText(canvas, hint, (SIDEBAR_W + 10, max(22, y_off + 22)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 230, 255), 2, cv2.LINE_AA)
 
     # --- draw bounding boxes (scaled from frame coords to canvas coords) ---
     show_popup   = canvas_meta.get("show_popup", False)
@@ -572,11 +635,13 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
             popup_anchor = (sx1, sy1)
 
     # --- draw preview boxes from saved tracks ---
-    for (x1, y1, x2, y2, lbl, col, ann_lines) in preview_boxes:
+    for (x1, y1, x2, y2, lbl, col, ann_lines, traj_points) in preview_boxes:
         sx1 = int(x_off + x1 * scale)
         sy1 = int(y_off + y1 * scale)
         sx2 = int(x_off + x2 * scale)
         sy2 = int(y_off + y2 * scale)
+        if traj_points:
+            draw_smooth_polyline(canvas, traj_points, x_off, y_off, scale, col, thickness=2)
         cv2.rectangle(canvas, (sx1, sy1), (sx2, sy2), col, 2)
         label_y = max(sy1 - 6, y_off + 14)
         cv2.putText(canvas, lbl, (sx1 + 4, label_y),
@@ -646,7 +711,44 @@ def _markers_path(video_path):
     return os.path.splitext(os.path.abspath(video_path))[0] + "_tracks.json"
 
 
-def save_markers_to_json(video_path, markers):
+def _point_in_polygon(pt, polygon_points):
+    if len(polygon_points) < 3:
+        return False
+    poly_np = np.array(polygon_points, dtype=np.int32)
+    return cv2.pointPolygonTest(poly_np, (float(pt[0]), float(pt[1])), False) >= 0
+
+
+def _apply_polygon_crosswalk_state(mode, states, box, polygon_points):
+    """Set crosswalk per-frame states from bbox bottom corners and polygon."""
+    out = dict(states)
+    if len(polygon_points) < 3:
+        return out
+    x1, y1, x2, y2 = box
+    left_in = _point_in_polygon((x1, y2), polygon_points)
+    right_in = _point_in_polygon((x2, y2), polygon_points)
+    if mode == 'person' and 'crosswalk position' in out:
+        if left_in and right_in:
+            out['crosswalk position'] = 'inside crosswalk'
+        elif (not left_in) and (not right_in):
+            out['crosswalk position'] = 'outside crosswalk'
+    elif mode == 'vehicle' and 'position' in out:
+        if left_in and right_in:
+            out['position'] = 'inside crosswalk'
+        elif (not left_in) and (not right_in):
+            out['position'] = 'outside crosswalk'
+    return out
+
+
+def _apply_polygon_to_history(track_history, polygon_points):
+    if len(polygon_points) < 3:
+        return
+    for fn in list(track_history.keys()):
+        x1, y1, x2, y2, lbl, mode, states = track_history[fn]
+        states = _apply_polygon_crosswalk_state(mode, states, (x1, y1, x2, y2), polygon_points)
+        track_history[fn] = (x1, y1, x2, y2, lbl, mode, states)
+
+
+def save_markers_to_json(video_path, markers, polygon=None):
     """Persist only the markers list into the JSON file without touching saved tracks."""
     outpath = _markers_path(video_path)
     if os.path.isfile(outpath):
@@ -654,16 +756,23 @@ def save_markers_to_json(video_path, markers):
             _raw = json.load(f)
         if isinstance(_raw, dict):
             all_tracks = _raw.get("tracks", [])
+            old_polygon = _raw.get("polygon", [])
         else:
             all_tracks = _raw
+            old_polygon = []
     else:
         all_tracks = []
-    out_doc = {"tracks": all_tracks, "markers": markers}
+        old_polygon = []
+    out_doc = {
+        "tracks": all_tracks,
+        "markers": markers,
+        "polygon": polygon if polygon is not None else old_polygon,
+    }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
 
 
-def save_track_to_json(video_path, track_history, fps, markers=None):
+def save_track_to_json(video_path, track_history, fps, markers=None, polygon=None):
     """Append the current track (with per-frame mode+states) to the JSON file.
     Saves markers alongside tracks. Returns the saved track dict.
     """
@@ -674,10 +783,13 @@ def save_track_to_json(video_path, track_history, fps, markers=None):
             _raw = json.load(f)
         if isinstance(_raw, dict):
             all_tracks = _raw.get("tracks", [])
+            old_polygon = _raw.get("polygon", [])
         else:
             all_tracks = _raw   # migrate old format
+            old_polygon = []
     else:
         all_tracks = []
+        old_polygon = []
 
     frames_data = []
     for frame_num in sorted(track_history.keys()):
@@ -720,7 +832,11 @@ def save_track_to_json(video_path, track_history, fps, markers=None):
     }
     all_tracks.append(track_dict)
 
-    out_doc = {"tracks": all_tracks, "markers": markers or []}
+    out_doc = {
+        "tracks": all_tracks,
+        "markers": markers or [],
+        "polygon": polygon if polygon is not None else old_polygon,
+    }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
 
@@ -742,7 +858,7 @@ def reset_botsort(model):
             pass
 
 
-def run_tracking(model, frame, click_pos=None, tracked_id=None):
+def run_tracking(model, frame, click_pos=None, tracked_id=None, do_log=False):
     """Run YOLO+BotSort on frame – class-agnostic.
 
     click_pos  – (fx, fy) lock onto whichever box the click lands in.
@@ -750,8 +866,16 @@ def run_tracking(model, frame, click_pos=None, tracked_id=None):
 
     Returns (boxes, new_tracked_id, tracked_label).
     """
-    results = model.track(frame, tracker="botsort.yaml",
-                          persist=True, verbose=False)[0]
+    results = model.track(
+        frame,
+        tracker="botsort.yaml",
+        persist=True,
+        verbose=False,
+        imgsz=TRACK_INFER_IMGSZ,
+        conf=0.25,
+        iou=0.6,
+        classes=DETECT_CLASS_IDS,
+    )[0]
 
     all_dets = []   # (tid, x1, y1, x2, y2, class_name)
     if results.boxes.id is not None:
@@ -761,16 +885,19 @@ def run_tracking(model, frame, click_pos=None, tracked_id=None):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             all_dets.append((tid, x1, y1, x2, y2, cls_name))
 
-    print(f"[botsort] detections={len(all_dets)} tracked_id={tracked_id}")
+    if do_log:
+        print(f"[botsort] detections={len(all_dets)} tracked_id={tracked_id}")
 
     # --- user clicked: lock onto whichever box contains the click ---
     if click_pos is not None:
         fx, fy = click_pos
         for (tid, x1, y1, x2, y2, cls_name) in all_dets:
             if x1 <= fx <= x2 and y1 <= fy <= y2:
-                print(f"[botsort] locked id={tid} cls={cls_name}")
+                if do_log:
+                    print(f"[botsort] locked id={tid} cls={cls_name}")
                 return [(x1, y1, x2, y2, cls_name, TRACK_COLOR)], tid, cls_name
-        print("[botsort] click outside all boxes – showing all")
+        if do_log:
+            print("[botsort] click outside all boxes – showing all")
         boxes = [(x1, y1, x2, y2, cls_name, DIM_COLOR)
                  for (_, x1, y1, x2, y2, cls_name) in all_dets]
         return boxes, None, ""
@@ -780,7 +907,8 @@ def run_tracking(model, frame, click_pos=None, tracked_id=None):
         for (tid, x1, y1, x2, y2, cls_name) in all_dets:
             if tid == tracked_id:
                 return [(x1, y1, x2, y2, cls_name, TRACK_COLOR)], tracked_id, cls_name
-        print(f"[botsort] lost id={tracked_id}")
+        if do_log:
+            print(f"[botsort] lost id={tracked_id}")
         return [], None, ""
 
     return [], None, ""
@@ -828,7 +956,17 @@ def main():
         print(f"Error: File not found: {video_path}")
         sys.exit(1)
 
+    cv2.setUseOptimized(True)
+    try:
+        cv2.setNumThreads(max(1, os.cpu_count() or 1))
+    except Exception:
+        pass
+
     cap = cv2.VideoCapture(video_path)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
     # cap.set(cv2.CAP_PROP_FPS, 30.0)
     if not cap.isOpened():
         print(f"Error: Cannot open video: {video_path}")
@@ -873,6 +1011,11 @@ def main():
     saved_tracks    = []    # list of full track dicts (with '_frame_lookup')
     previewed_idxs  = set() # indices of saved_tracks currently being previewed
     track_list_page = 0
+    speed_4x        = False  # Z toggles 4x playback speed
+    track_infer_tick = 0      # increments during live playback while locked
+    cached_track_box = None   # (x1,y1,x2,y2,label) reused between infer ticks
+    polygon_points  = []     # list of 4 (x, y) points in frame coordinates
+    polygon_confirmed = False
     video_name      = os.path.basename(video_path)
 
     # Load existing tracks from JSON on startup
@@ -885,18 +1028,30 @@ def main():
             if isinstance(_loaded, dict):
                 _tracks_raw  = _loaded.get("tracks", [])
                 _markers_raw = _loaded.get("markers", [])
+                _polygon_raw = _loaded.get("polygon", [])
             else:
                 _tracks_raw  = _loaded
                 _markers_raw = []
+                _polygon_raw = []
             for _td in _tracks_raw:
                 _td["_frame_lookup"] = build_frame_lookup(_td)
+                _td["_person_path_pts"] = build_person_path_points(_td)
                 saved_tracks.append(_td)
             for _m in _markers_raw:
                 markers.append(_m)
                 marker_counter = max(marker_counter,
                     int(_m["label"][1:]) if _m["label"].startswith("M") and
                     _m["label"][1:].isdigit() else marker_counter)
+            if isinstance(_polygon_raw, list):
+                polygon_points = [(int(p[0]), int(p[1]))
+                                  for p in _polygon_raw
+                                  if isinstance(p, (list, tuple)) and len(p) == 2]
+            if len(polygon_points) > 4:
+                polygon_points = polygon_points[:4]
+            polygon_confirmed = (len(polygon_points) == 4)
             print(f"[load] {len(saved_tracks)} tracks, {len(markers)} markers loaded")
+            if polygon_confirmed:
+                print("[load] crosswalk polygon loaded")
             # Auto-seek to first marker if any
             if markers:
                 first_m = min(markers, key=lambda mk: mk["frame"])
@@ -905,6 +1060,10 @@ def main():
                 print(f"[load] auto-seek to marker '{first_m['label']}' at frame {current_frame}")
         except Exception as _e:
             print(f"[load] failed to read {json_path}: {_e}")
+
+    if not polygon_confirmed:
+        paused = True
+        print("[setup] draw crosswalk polygon with 4 clicks, Enter to confirm")
 
     while True:
         in_history  = (tracked_id is None and current_frame in track_history)
@@ -920,13 +1079,17 @@ def main():
                     px1, py1, px2, py2, plbl, pmode, pstates = lu[current_frame]
                     pcol      = PREVIEW_COLORS[pidx % len(PREVIEW_COLORS)]
                     ann_lines = [(pmode, "mode")]
+                    traj_points = []
                     if pstates:
                         for entry in _ordered_state_cats(pmode):
                             pcat = entry[0]
                             if pcat in pstates:
                                 ann_lines.append((str(pstates[pcat]),
                                                   entry[2] if len(entry) > 2 else 'per_frame'))
-                    preview_boxes.append((px1, py1, px2, py2, plbl, pcol, ann_lines))
+                    if pmode == "person":
+                        path_all = saved_tracks[pidx].get("_person_path_pts", [])
+                        traj_points = [(mx, my) for (fn, mx, my) in path_all if fn <= current_frame]
+                    preview_boxes.append((px1, py1, px2, py2, plbl, pcol, ann_lines, traj_points))
 
         _dr = _state["drag_start"]
         _dc = _state["drag_current"]
@@ -945,16 +1108,26 @@ def main():
                                "track_list_page":track_list_page,
                                "video_name":     video_name,
                                "markers":        markers,
-                               "drag_rect":      _drag_rect})
+                               "drag_rect":      _drag_rect,
+                               "polygon_points": polygon_points,
+                               "polygon_setup":  not polygon_confirmed})
         cv2.imshow(WINDOW_NAME, canvas)
 
-        wait_ms = 30 if paused else frame_delay_ms
+        wait_ms = 30 if paused else max(
+            FAST_PLAY_WAIT_MS,
+            (frame_delay_ms // 4) if speed_4x else frame_delay_ms
+        )
         key = cv2.waitKeyEx(wait_ms)
 
         # --- timeline click → seek ---
         if _state["seek_frame"] is not None:
+            if not polygon_confirmed:
+                _state["seek_frame"] = None
+                continue
             paused     = True
             tracked_id = None
+            cached_track_box = None
+            track_infer_tick = 0
             show_popup = False
             reset_botsort(model)
             ret, frame, current_frame = seek(cap, _state["seek_frame"], total_frames)
@@ -972,6 +1145,9 @@ def main():
 
         # --- sidebar click → track-list interaction ---
         if _state["sidebar_click"] is not None:
+            if not polygon_confirmed:
+                _state["sidebar_click"] = None
+                continue
             scx, scy = _state["sidebar_click"]
             _state["sidebar_click"] = None
             total_pages = max(1, (len(saved_tracks) + TRACKS_PER_PAGE - 1) // TRACKS_PER_PAGE)
@@ -1003,7 +1179,7 @@ def main():
                     idx = zone["idx"]
                     if 0 <= idx < len(markers):
                         del markers[idx]
-                        save_markers_to_json(video_path, markers)
+                        save_markers_to_json(video_path, markers, polygon_points)
                     break
                 elif ztype == "show_all":
                     previewed_idxs = set(range(len(saved_tracks)))
@@ -1021,6 +1197,9 @@ def main():
 
         # --- drag end → add manual bounding box ---
         if _state["drag_end"] is not None:
+            if not polygon_confirmed:
+                _state["drag_end"] = None
+                continue
             dcx1, dcy1, dcx2, dcy2 = _state["drag_end"]
             _state["drag_end"] = None
             fp1 = canvas_to_frame(dcx1, dcy1)
@@ -1045,12 +1224,16 @@ def main():
                     else:
                         draw_mode   = track_mode
                         draw_states = dict(track_states)
+                    draw_states = _apply_polygon_crosswalk_state(
+                        draw_mode, draw_states, (fx1, fy1, fx2, fy2), polygon_points)
                     draw_label  = draw_mode
                     track_history[current_frame] = (fx1, fy1, fx2, fy2,
                                                     draw_label, draw_mode, draw_states)
                     track_mode    = draw_mode
                     track_states  = dict(draw_states)
                     tracked_id    = None
+                    cached_track_box = None
+                    track_infer_tick = 0
                     tracked_label = draw_label
                     boxes         = [(fx1, fy1, fx2, fy2, draw_label, TRACK_COLOR)]
                     paused        = True
@@ -1062,6 +1245,14 @@ def main():
         if _state["detect_click"] is not None:
             cx, cy = _state["detect_click"]
             _state["detect_click"] = None
+
+            if not polygon_confirmed:
+                frame_pos = canvas_to_frame(cx, cy)
+                if frame_pos is not None and len(polygon_points) < 4:
+                    polygon_points.append((int(frame_pos[0]), int(frame_pos[1])))
+                    print(f"[setup] polygon point {len(polygon_points)}/4 added")
+                continue
+
             # If popup is visible, check popup zones first
             hit_popup = False
             if show_popup:
@@ -1077,6 +1268,9 @@ def main():
                             if current_frame in track_history:
                                 x1h,y1h,x2h,y2h,lblh,_,_ = track_history[current_frame]
                                 # label follows mode
+                                adj_states = _apply_polygon_crosswalk_state(
+                                    track_mode, track_states, (x1h, y1h, x2h, y2h), polygon_points)
+                                track_states = dict(adj_states)
                                 track_history[current_frame] = (
                                     x1h, y1h, x2h, y2h, track_mode,
                                     track_mode, dict(track_states))
@@ -1115,14 +1309,22 @@ def main():
                     if not hit_popup:
                         paused     = True
                         boxes, tracked_id, tracked_label = run_tracking(
-                            model, frame, click_pos=frame_pos)
+                            model, frame, click_pos=frame_pos, do_log=True)
                         if tracked_id is not None:
+                            if boxes:
+                                bx1, by1, bx2, by2, blbl, _ = boxes[0]
+                                cached_track_box = (bx1, by1, bx2, by2, blbl)
+                            else:
+                                cached_track_box = None
+                            track_infer_tick = 0
                             last_states_per_mode[track_mode] = dict(track_states)
                             track_mode   = YOLO_CLASS_MAP.get(tracked_label, DEFAULT_MODE)
                             track_states = dict(last_states_per_mode.get(
                                 track_mode, _default_track_states(track_mode)))
                             show_popup   = True
                         else:
+                            cached_track_box = None
+                            track_infer_tick = 0
                             show_popup   = False
             continue
 
@@ -1133,28 +1335,49 @@ def main():
             if key_ch in (ord('q'), ord('Q'), 27):    # Q / Esc
                 break
 
+            if not polygon_confirmed:
+                if key_ch in KEY_BKSP:
+                    polygon_points = []
+                    print("[setup] polygon points cleared")
+                elif key_ch in KEY_ENTER:
+                    if len(polygon_points) == 4:
+                        polygon_confirmed = True
+                        save_markers_to_json(video_path, markers, polygon_points)
+                        print("[setup] crosswalk polygon confirmed")
+                    else:
+                        print("[setup] need exactly 4 points before confirm")
+                continue
+
             elif key_ch in (ord('m'), ord('M')):       # M – add named marker
                 marker_counter += 1
                 mlabel = f"M{marker_counter}"
                 markers.append({"label": mlabel, "frame": current_frame})
                 markers.sort(key=lambda mk: mk["frame"])
-                save_markers_to_json(video_path, markers)
+                save_markers_to_json(video_path, markers, polygon_points)
                 print(f"[marker] added {mlabel} at frame {current_frame}")
 
             elif key_ch == 32:                         # Space – play/pause
                 paused     = not paused
                 show_popup = False  # dismiss popup when playback resumes
 
+            elif key_ch == ord('z'):                    # Z - toggle 4x speed
+                speed_4x = not speed_4x
+
             elif key_ch in KEY_ENTER:                  # Enter – save current track
                 if track_history:
                     interpolate_track_history(track_history)
-                    track_dict = save_track_to_json(video_path, track_history, fps, markers)
+                    _apply_polygon_to_history(track_history, polygon_points)
+                    track_dict = save_track_to_json(
+                        video_path, track_history, fps, markers, polygon_points)
                     track_dict["_frame_lookup"] = build_frame_lookup(track_dict)
+                    track_dict["_person_path_pts"] = build_person_path_points(track_dict)
                     saved_tracks.append(track_dict)
                     last_states_per_mode[track_mode] = dict(track_states)
                     track_history  = {}
                     boxes          = []
                     tracked_id     = None
+                    cached_track_box = None
+                    track_infer_tick = 0
                     tracked_label  = ""
                     show_popup     = False
                     track_mode     = DEFAULT_MODE
@@ -1176,6 +1399,8 @@ def main():
                         del track_history[f]
                     if tracked_id is not None and not track_history:
                         tracked_id    = None
+                        cached_track_box = None
+                        track_infer_tick = 0
                         tracked_label = ""
                         reset_botsort(model)
                     if current_frame in track_history:
@@ -1191,6 +1416,8 @@ def main():
                         del track_history[f]
                     if tracked_id is not None and not track_history:
                         tracked_id    = None
+                        cached_track_box = None
+                        track_infer_tick = 0
                         tracked_label = ""
                         reset_botsort(model)
                     print(f"[trim] deleted {len(deleted)} frames before frame {current_frame}")
@@ -1200,6 +1427,8 @@ def main():
                     track_history = {}
                     boxes         = []
                     tracked_id    = None
+                    cached_track_box = None
+                    track_infer_tick = 0
                     tracked_label = ""
                     show_popup    = False
                     track_mode    = DEFAULT_MODE
@@ -1211,6 +1440,8 @@ def main():
             elif key in KEY_RIGHT:                     # → scrub forward
                 paused     = True
                 tracked_id = None
+                cached_track_box = None
+                track_infer_tick = 0
                 show_popup = False
                 reset_botsort(model)
                 ret, frame, current_frame = seek(cap, current_frame + SCRUB_STEP, total_frames)
@@ -1227,6 +1458,8 @@ def main():
             elif key in KEY_LEFT:                      # ← scrub backward
                 paused     = True
                 tracked_id = None
+                cached_track_box = None
+                track_infer_tick = 0
                 show_popup = False
                 reset_botsort(model)
                 ret, frame, current_frame = seek(cap, current_frame - SCRUB_STEP, total_frames)
@@ -1242,21 +1475,48 @@ def main():
 
         # --- advance playback ---
         if not paused:
-            ret, next_frame = cap.read()
-            if not ret:
+            # Fast path: grab (cheap), skip extra frames, then decode once.
+            got = cap.grab()
+            if not got:
                 paused = True
             else:
+                for _ in range(PLAYBACK_SKIP_FRAMES):
+                    if not cap.grab():
+                        break
+                ret, next_frame = cap.retrieve()
+                if not ret:
+                    paused = True
+                    continue
+
                 frame         = next_frame
                 current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
                 show_popup    = False  # popup is click-frame only
 
                 if tracked_id is not None:
-                    # Live BotSort tracking (user clicked to lock a target)
-                    boxes, tracked_id, tracked_label = run_tracking(
-                        model, frame, tracked_id=tracked_id)
+                    # Live tracking with throttled inference and bbox reuse.
+                    track_infer_tick += 1
+                    should_infer = (
+                        track_infer_tick % TRACK_INFER_EVERY_N == 0
+                        or cached_track_box is None
+                    )
+                    if should_infer:
+                        boxes, tracked_id, tracked_label = run_tracking(
+                            model, frame, tracked_id=tracked_id)
+                        if boxes:
+                            x1c, y1c, x2c, y2c, lblc, _ = boxes[0]
+                            cached_track_box = (x1c, y1c, x2c, y2c, lblc)
+                        else:
+                            cached_track_box = None
+                    elif cached_track_box is not None:
+                        x1c, y1c, x2c, y2c, lblc = cached_track_box
+                        boxes = [(x1c, y1c, x2c, y2c, lblc, TRACK_COLOR)]
+
                     # Record to history with per-frame mode and states
                     if boxes:
                         x1, y1, x2, y2, lbl, _ = boxes[0]
+                        auto_states = _apply_polygon_crosswalk_state(
+                            track_mode, track_states, (x1, y1, x2, y2), polygon_points)
+                        track_states = dict(auto_states)
                         track_history[current_frame] = (x1, y1, x2, y2, lbl,
                                                         track_mode, dict(track_states))
                 elif current_frame in track_history:
