@@ -708,7 +708,18 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
 
 
 def _markers_path(video_path):
-    return os.path.splitext(os.path.abspath(video_path))[0] + "_tracks.json"
+    video_abs = os.path.abspath(video_path)
+    video_dir = os.path.dirname(video_abs)
+    base_name = os.path.splitext(os.path.basename(video_abs))[0]
+    # Preferred location: next to video file, same base name.
+    primary = os.path.join(video_dir, f"{base_name}.json")
+    # Backward-compatible legacy location used by older versions.
+    legacy = os.path.join(video_dir, base_name, f"{base_name}.json")
+    if os.path.isfile(primary):
+        return primary
+    if os.path.isfile(legacy):
+        return legacy
+    return primary
 
 
 def _point_in_polygon(pt, polygon_points):
@@ -751,6 +762,7 @@ def _apply_polygon_to_history(track_history, polygon_points):
 def save_markers_to_json(video_path, markers, polygon=None):
     """Persist only the markers list into the JSON file without touching saved tracks."""
     outpath = _markers_path(video_path)
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
     if os.path.isfile(outpath):
         with open(outpath, "r") as f:
             _raw = json.load(f)
@@ -777,6 +789,7 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
     Saves markers alongside tracks. Returns the saved track dict.
     """
     outpath = _markers_path(video_path)
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
 
     if os.path.isfile(outpath):
         with open(outpath, "r") as f:
@@ -1019,7 +1032,7 @@ def main():
     video_name      = os.path.basename(video_path)
 
     # Load existing tracks from JSON on startup
-    json_path = os.path.splitext(os.path.abspath(video_path))[0] + "_tracks.json"
+    json_path = _markers_path(video_path)
     if os.path.isfile(json_path):
         try:
             with open(json_path) as _f:
