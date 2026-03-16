@@ -112,6 +112,9 @@ _state = {
     "drag_start":    None,   # LBUTTONDOWN in video area → (cx, cy) canvas coords
     "drag_current":  None,   # MOUSEMOVE while dragging  → (cx, cy) canvas coords
     "drag_end":      None,   # LBUTTONUP after drag      → (cx1,cy1,cx2,cy2)
+    "polygon_drag_idx":     None,   # active polygon point index while dragging
+    "polygon_drag_current": None,   # current canvas position of dragged polygon point
+    "polygon_drag_end":     None,   # (idx, cx, cy) when polygon drag completes
 }
 
 _DRAG_THRESHOLD = 8   # pixels; smaller motion treated as click, not a draw
@@ -148,15 +151,30 @@ def on_mouse(event, x, y, flags, param):
         elif x < SIDEBAR_W:
             _state["sidebar_click"] = (x, y)
         else:
+            for handle in _layout.get("polygon_handle_zones", []):
+                hx, hy = handle["center"]
+                radius = handle["radius"]
+                if (x - hx) * (x - hx) + (y - hy) * (y - hy) <= radius * radius:
+                    _state["polygon_drag_idx"] = handle["idx"]
+                    _state["polygon_drag_current"] = (x, y)
+                    return
             # Video area: start drag (may become a click if motion < threshold)
             _state["drag_start"]   = (x, y)
             _state["drag_current"] = (x, y)
 
     elif event == cv2.EVENT_MOUSEMOVE:
+        if _state["polygon_drag_idx"] is not None:
+            _state["polygon_drag_current"] = (x, y)
+            return
         if _state["drag_start"] is not None:
             _state["drag_current"] = (x, y)
 
     elif event == cv2.EVENT_LBUTTONUP:
+        if _state["polygon_drag_idx"] is not None:
+            _state["polygon_drag_end"] = (_state["polygon_drag_idx"], x, y)
+            _state["polygon_drag_idx"] = None
+            _state["polygon_drag_current"] = None
+            return
         if _state["drag_start"] is not None:
             ox, oy = _state["drag_start"]
             dx, dy = abs(x - ox), abs(y - oy)
@@ -235,6 +253,60 @@ def build_person_path_points(track_dict):
         pts.append((int(f.get("frame_num", 0)), float((x1 + x2) / 2.0), float(y2)))
     pts.sort(key=lambda t: t[0])
     return pts
+
+
+def _polygon_state_key(mode):
+    if mode == 'person':
+        return 'crosswalk position'
+    if mode == 'vehicle':
+        return 'position'
+    return None
+
+
+def _refresh_saved_track_polygon(track_dict, polygon_points):
+    poly_key = _polygon_state_key(track_dict.get("mode", DEFAULT_MODE))
+    for frame_data in track_dict.get("frames", []):
+        frame_mode = frame_data.get("mode", track_dict.get("mode", DEFAULT_MODE))
+        poly_key = _polygon_state_key(frame_mode)
+        if poly_key is None:
+            continue
+        merged_states = dict(track_dict.get("track_states", {}))
+        merged_states.update(frame_data.get("states", {}))
+        x1, y1, x2, y2 = frame_data.get("box", [0, 0, 0, 0])
+        updated_states = _apply_polygon_crosswalk_state(
+            frame_mode, merged_states, (x1, y1, x2, y2), polygon_points)
+        frame_states = dict(frame_data.get("states", {}))
+        if poly_key in updated_states:
+            frame_states[poly_key] = updated_states[poly_key]
+        frame_data["states"] = frame_states
+    track_dict["_frame_lookup"] = build_frame_lookup(track_dict)
+    track_dict["_person_path_pts"] = build_person_path_points(track_dict)
+
+
+def _serialize_track_dict(track_dict):
+    out = {}
+    for key, value in track_dict.items():
+        if key.startswith("_"):
+            continue
+        if key == "frames":
+            out[key] = [dict(frame) for frame in value]
+        elif isinstance(value, dict):
+            out[key] = dict(value)
+        else:
+            out[key] = value
+    return out
+
+
+def save_all_annotations_to_json(video_path, saved_tracks, markers, polygon=None):
+    outpath = _markers_path(video_path)
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
+    out_doc = {
+        "tracks": [_serialize_track_dict(track) for track in saved_tracks],
+        "markers": markers,
+        "polygon": polygon or [],
+    }
+    with open(outpath, "w") as f:
+        json.dump(out_doc, f, indent=2)
 
 
 def draw_smooth_polyline(canvas, frame_pts, x_off, y_off, scale, color, thickness=2):
@@ -566,6 +638,8 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
 
     # --- crosswalk polygon (always shown when present) ---
     polygon_points = canvas_meta.get("polygon_points", [])
+    polygon_drag_idx = canvas_meta.get("polygon_drag_idx")
+    polygon_handle_zones = []
     if polygon_points:
         p_canvas = [(int(x_off + px * scale), int(y_off + py * scale))
                     for (px, py) in polygon_points]
@@ -575,13 +649,22 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
                 cv2.line(canvas, p_canvas[i], p_canvas[i + 1], draw_col, 2, cv2.LINE_AA)
             if len(p_canvas) == 4:
                 cv2.line(canvas, p_canvas[-1], p_canvas[0], POLY_COLOR, 2, cv2.LINE_AA)
-        for p in p_canvas:
-            cv2.circle(canvas, p, 4, POLY_COLOR, -1, cv2.LINE_AA)
+        for idx, p in enumerate(p_canvas):
+            radius = 8 if idx == polygon_drag_idx else 6
+            fill = (0, 200, 255) if idx == polygon_drag_idx else POLY_COLOR
+            cv2.circle(canvas, p, radius, fill, -1, cv2.LINE_AA)
+            cv2.circle(canvas, p, radius + 2, (20, 20, 20), 1, cv2.LINE_AA)
+            polygon_handle_zones.append({"idx": idx, "center": p, "radius": 12})
+    _layout["polygon_handle_zones"] = polygon_handle_zones
 
     if canvas_meta.get("polygon_setup", False):
-        hint = "Crosswalk setup: click 4 points, Enter=confirm, Backspace=clear"
+        hint = "Crosswalk setup: click 4 points, drag points to adjust, Enter=confirm, Backspace=clear"
         cv2.putText(canvas, hint, (SIDEBAR_W + 10, max(22, y_off + 22)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 230, 255), 2, cv2.LINE_AA)
+    elif polygon_points:
+        hint = "Drag polygon points to adjust crosswalk"
+        cv2.putText(canvas, hint, (SIDEBAR_W + 10, max(22, y_off + 22)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 230, 255), 1, cv2.LINE_AA)
 
     # --- draw bounding boxes (scaled from frame coords to canvas coords) ---
     show_popup   = canvas_meta.get("show_popup", False)
@@ -1079,6 +1162,14 @@ def main():
         print("[setup] draw crosswalk polygon with 4 clicks, Enter to confirm")
 
     while True:
+        display_polygon_points = list(polygon_points)
+        drag_idx = _state["polygon_drag_idx"]
+        drag_cur = _state["polygon_drag_current"]
+        if drag_idx is not None and drag_cur is not None and drag_idx < len(display_polygon_points):
+            drag_frame_pos = canvas_to_frame(drag_cur[0], drag_cur[1])
+            if drag_frame_pos is not None:
+                display_polygon_points[drag_idx] = (int(drag_frame_pos[0]), int(drag_frame_pos[1]))
+
         in_history  = (tracked_id is None and current_frame in track_history)
         _annotation = {"mode": track_mode, "states": dict(track_states)} \
                       if (tracked_id is not None or in_history) else None
@@ -1122,7 +1213,8 @@ def main():
                                "video_name":     video_name,
                                "markers":        markers,
                                "drag_rect":      _drag_rect,
-                               "polygon_points": polygon_points,
+                               "polygon_points": display_polygon_points,
+                               "polygon_drag_idx": drag_idx,
                                "polygon_setup":  not polygon_confirmed})
         cv2.imshow(WINDOW_NAME, canvas)
 
@@ -1154,6 +1246,32 @@ def main():
             else:
                 boxes         = []
                 tracked_label = ""
+            continue
+
+        # --- polygon point drag end → move crosswalk point and refresh states ---
+        if _state["polygon_drag_end"] is not None:
+            drag_idx, drag_cx, drag_cy = _state["polygon_drag_end"]
+            _state["polygon_drag_end"] = None
+            frame_pos = canvas_to_frame(drag_cx, drag_cy)
+            if frame_pos is not None and 0 <= drag_idx < len(polygon_points):
+                polygon_points[drag_idx] = (int(frame_pos[0]), int(frame_pos[1]))
+                _apply_polygon_to_history(track_history, polygon_points)
+                for saved_track in saved_tracks:
+                    _refresh_saved_track_polygon(saved_track, polygon_points)
+                if current_frame in track_history:
+                    hx1, hy1, hx2, hy2, hlbl, hmode, hstates = track_history[current_frame]
+                    if tracked_id is None:
+                        boxes = [(hx1, hy1, hx2, hy2, hlbl, HISTORY_COLOR)]
+                        tracked_label = hlbl
+                    track_mode = hmode
+                    track_states = dict(hstates)
+                elif tracked_id is not None and boxes:
+                    x1b, y1b, x2b, y2b, _, _ = boxes[0]
+                    track_states = _apply_polygon_crosswalk_state(
+                        track_mode, track_states, (x1b, y1b, x2b, y2b), polygon_points)
+                if polygon_confirmed:
+                    save_all_annotations_to_json(video_path, saved_tracks, markers, polygon_points)
+                print(f"[polygon] moved point {drag_idx + 1}/{len(polygon_points)}")
             continue
 
         # --- sidebar click → track-list interaction ---
