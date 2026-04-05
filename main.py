@@ -67,6 +67,13 @@ TRACK_STATES = {
         ('type',                  ['suv', 'truck', 'bus', 'sedan', 'van', 'pickup'],                            'per_track'),
         ('wait time',             ['just arrived', 'waited'],                                                   'per_track'),
     ],
+    'vehicle-pos': [
+        ('movement',              ['turning', 'waiting'],                                                       'per_frame'),
+        ('position',              ['outside crosswalk', 'inside crosswalk'],                                    'per_frame'),
+        ('interaction',           ['no interaction', 'honk', 'gap-find', 'gesture', 'verbal', 'eye-contact'],   'per_frame'),
+        ('type',                  ['suv', 'truck', 'bus', 'sedan', 'van', 'pickup'],                            'per_track'),
+        ('wait time',             ['just arrived', 'waited'],                                                   'per_track'),
+    ],
 }
 
 # Popup appearance
@@ -115,6 +122,11 @@ _state = {
     "polygon_drag_idx":     None,   # active polygon point index while dragging
     "polygon_drag_current": None,   # current canvas position of dragged polygon point
     "polygon_drag_end":     None,   # (idx, cx, cy) when polygon drag completes
+    "hover_pos":      None,   # current mouse canvas position
+    "vp_drag_start":  None,   # (cx, cy) start while dragging vehicle-pos line
+    "vp_drag_line":   None,   # (line_x, line_y1, line_y2) at drag start (canvas)
+    "vp_drag_current": None,  # current mouse canvas position during vehicle-pos drag
+    "vp_drag_end":    None,   # (line_x, line_y1, line_y2) after drag completes (canvas)
 }
 
 _DRAG_THRESHOLD = 8   # pixels; smaller motion treated as click, not a draw
@@ -144,6 +156,9 @@ def on_mouse(event, x, y, flags, param):
     screen_w, screen_h, total_frames = param
     timeline_top = int(screen_h * 0.90)
 
+    if event == cv2.EVENT_MOUSEMOVE:
+        _state["hover_pos"] = (x, y)
+
     if event == cv2.EVENT_LBUTTONDOWN:
         if y >= timeline_top:
             if total_frames > 0:
@@ -151,6 +166,15 @@ def on_mouse(event, x, y, flags, param):
         elif x < SIDEBAR_W:
             _state["sidebar_click"] = (x, y)
         else:
+            vp_zone = _layout.get("vehicle_pos_line_zone")
+            if vp_zone is not None:
+                lx, ly1, ly2 = vp_zone["x"], vp_zone["y1"], vp_zone["y2"]
+                tol = vp_zone.get("tol", 10)
+                if abs(x - lx) <= tol and (min(ly1, ly2) - tol) <= y <= (max(ly1, ly2) + tol):
+                    _state["vp_drag_start"] = (x, y)
+                    _state["vp_drag_line"] = (lx, ly1, ly2)
+                    _state["vp_drag_current"] = (x, y)
+                    return
             for handle in _layout.get("polygon_handle_zones", []):
                 hx, hy = handle["center"]
                 radius = handle["radius"]
@@ -163,6 +187,9 @@ def on_mouse(event, x, y, flags, param):
             _state["drag_current"] = (x, y)
 
     elif event == cv2.EVENT_MOUSEMOVE:
+        if _state["vp_drag_start"] is not None:
+            _state["vp_drag_current"] = (x, y)
+            return
         if _state["polygon_drag_idx"] is not None:
             _state["polygon_drag_current"] = (x, y)
             return
@@ -170,6 +197,16 @@ def on_mouse(event, x, y, flags, param):
             _state["drag_current"] = (x, y)
 
     elif event == cv2.EVENT_LBUTTONUP:
+        if _state["vp_drag_start"] is not None and _state["vp_drag_line"] is not None:
+            sx, sy = _state["vp_drag_start"]
+            lx, ly1, ly2 = _state["vp_drag_line"]
+            dx = x - sx
+            dy = y - sy
+            _state["vp_drag_end"] = (lx + dx, ly1 + dy, ly2 + dy)
+            _state["vp_drag_start"] = None
+            _state["vp_drag_line"] = None
+            _state["vp_drag_current"] = None
+            return
         if _state["polygon_drag_idx"] is not None:
             _state["polygon_drag_end"] = (_state["polygon_drag_idx"], x, y)
             _state["polygon_drag_idx"] = None
@@ -243,22 +280,55 @@ def _default_track_states(mode):
 
 
 def build_person_path_points(track_dict):
-    """Return sorted [(frame_num, mid_x, bottom_y)] for person frames in a track."""
+    """Return sorted [(frame_num, x, bottom_y)] path points for supported modes."""
     pts = []
     for f in track_dict.get("frames", []):
         fmode = f.get("mode", track_dict.get("mode", DEFAULT_MODE))
-        if fmode != "person":
+        if fmode not in ("person", "vehicle-pos"):
             continue
         x1, y1, x2, y2 = f.get("box", [0, 0, 0, 0])
-        pts.append((int(f.get("frame_num", 0)), float((x1 + x2) / 2.0), float(y2)))
+        if fmode == "vehicle-pos":
+            px = float(x1)
+        else:
+            px = float((x1 + x2) / 2.0)
+        pts.append((int(f.get("frame_num", 0)), px, float(y2)))
     pts.sort(key=lambda t: t[0])
     return pts
+
+
+def _vehicle_line_len_from_box(box, frame_h):
+    x1, y1, x2, y2 = box
+    span = abs(int(y2) - int(y1))
+    if span > 0:
+        return span
+    return max(18, int(frame_h * 0.12))
+
+
+def _vehicle_pos_box_from_anchor(anchor, frame_shape, base_box=None):
+    """Create a vertical-line box (x1==x2) from anchor bottom point in frame coords."""
+    ax, ay = int(anchor[0]), int(anchor[1])
+    fh, fw = frame_shape[:2]
+    ax = max(0, min(ax, fw - 1))
+    ay = max(0, min(ay, fh - 1))
+    base_len = _vehicle_line_len_from_box(base_box, fh) if base_box is not None else max(18, int(fh * 0.12))
+    y2 = ay
+    y1 = max(0, y2 - base_len)
+    return (ax, y1, ax, y2)
+
+
+def _point_hits_track_box(fx, fy, box, mode, tol=6):
+    x1, y1, x2, y2 = box
+    if mode == "vehicle-pos":
+        lx = int(round((x1 + x2) / 2.0))
+        ly1, ly2 = (y1, y2) if y1 <= y2 else (y2, y1)
+        return (abs(fx - lx) <= tol) and (ly1 - tol <= fy <= ly2 + tol)
+    return x1 <= fx <= x2 and y1 <= fy <= y2
 
 
 def _polygon_state_key(mode):
     if mode == 'person':
         return 'crosswalk position'
-    if mode == 'vehicle':
+    if mode in ('vehicle', 'vehicle-pos'):
         return 'position'
     return None
 
@@ -610,6 +680,7 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         ("[BKSP] clear",         (200, 80, 80)),
         ("[A+BKSP] del before",  (200, 140, 60)),
         ("[S+A+BKSP] del after", (200, 140, 60)),
+        ("[V] vehicle-pos",      (140, 180, 220)),
         ("[click] detect",       (140, 140, 140)),
         ("[drag] draw box",      (210, 210, 50)),
         ("[<][>] frame step",    (140, 140, 140)),
@@ -697,39 +768,69 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
             cv2.putText(canvas, txt, (bx_left + 5, row_y0),
                         cv2.FONT_HERSHEY_SIMPLEX, ann_font, txt_col, 1, cv2.LINE_AA)
 
+    def _draw_vehicle_pos_line(sx, sy1, sy2, col, lbl, ann_lines=None):
+        ly1, ly2 = (sy1, sy2) if sy1 <= sy2 else (sy2, sy1)
+        cv2.line(canvas, (sx, ly1), (sx, ly2), col, 2, cv2.LINE_AA)
+        cv2.circle(canvas, (sx, ly2), 4, col, -1, cv2.LINE_AA)
+        label_y = max(ly1 - 6, y_off + 14)
+        cv2.putText(canvas, lbl, (sx + 6, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, col, 1, cv2.LINE_AA)
+        if ann_lines:
+            _draw_ann_overlay(ann_lines, sx + 2, label_y + 18, 0.40, 15)
+        return (sx, ly1, ly2)
+
+    vehicle_line_zone = None
+
     for (x1, y1, x2, y2, lbl, col) in boxes:
         sx1 = int(x_off + x1 * scale)
         sy1 = int(y_off + y1 * scale)
         sx2 = int(x_off + x2 * scale)
         sy2 = int(y_off + y2 * scale)
-        cv2.rectangle(canvas, (sx1, sy1), (sx2, sy2), col, 2)
-        label_y = max(sy1 - 6, y_off + 14)
-        cv2.putText(canvas, lbl, (sx1 + 4, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
-        if annotation and col != DIM_COLOR and not show_popup:
-            ann_lines = [(annotation["mode"], "mode")]
-            for entry in _ordered_state_cats(annotation["mode"]):
-                cat = entry[0]
-                if cat in annotation["states"]:
-                    ann_lines.append((str(annotation["states"][cat]),
-                                      entry[2] if len(entry) > 2 else 'per_frame'))
-            _draw_ann_overlay(ann_lines, sx1, label_y + 18, 0.42, 16)
+        is_vehicle_pos = (annotation is not None and annotation.get("mode") == "vehicle-pos") or (lbl == "vehicle-pos")
+        if is_vehicle_pos:
+            ann_lines = None
+            if annotation and col != DIM_COLOR and not show_popup:
+                ann_lines = [(annotation["mode"], "mode")]
+                for entry in _ordered_state_cats(annotation["mode"]):
+                    cat = entry[0]
+                    if cat in annotation["states"]:
+                        ann_lines.append((str(annotation["states"][cat]),
+                                          entry[2] if len(entry) > 2 else 'per_frame'))
+            zone = _draw_vehicle_pos_line(sx1, sy1, sy2, col, lbl, ann_lines)
+            if col in (TRACK_COLOR, HISTORY_COLOR):
+                vehicle_line_zone = {"x": zone[0], "y1": zone[1], "y2": zone[2], "tol": 10}
+        else:
+            cv2.rectangle(canvas, (sx1, sy1), (sx2, sy2), col, 2)
+            label_y = max(sy1 - 6, y_off + 14)
+            cv2.putText(canvas, lbl, (sx1 + 4, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+            if annotation and col != DIM_COLOR and not show_popup:
+                ann_lines = [(annotation["mode"], "mode")]
+                for entry in _ordered_state_cats(annotation["mode"]):
+                    cat = entry[0]
+                    if cat in annotation["states"]:
+                        ann_lines.append((str(annotation["states"][cat]),
+                                          entry[2] if len(entry) > 2 else 'per_frame'))
+                _draw_ann_overlay(ann_lines, sx1, label_y + 18, 0.42, 16)
         if popup_anchor is None and col in (TRACK_COLOR, HISTORY_COLOR):
             popup_anchor = (sx1, sy1)
 
     # --- draw preview boxes from saved tracks ---
-    for (x1, y1, x2, y2, lbl, col, ann_lines, traj_points) in preview_boxes:
+    for (x1, y1, x2, y2, lbl, col, ann_lines, traj_points, pmode) in preview_boxes:
         sx1 = int(x_off + x1 * scale)
         sy1 = int(y_off + y1 * scale)
         sx2 = int(x_off + x2 * scale)
         sy2 = int(y_off + y2 * scale)
         if traj_points:
             draw_smooth_polyline(canvas, traj_points, x_off, y_off, scale, col, thickness=2)
-        cv2.rectangle(canvas, (sx1, sy1), (sx2, sy2), col, 2)
-        label_y = max(sy1 - 6, y_off + 14)
-        cv2.putText(canvas, lbl, (sx1 + 4, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, col, 1, cv2.LINE_AA)
-        _draw_ann_overlay(ann_lines, sx1, label_y + 18, 0.40, 15)
+        if pmode == "vehicle-pos":
+            _draw_vehicle_pos_line(sx1, sy1, sy2, col, lbl, ann_lines)
+        else:
+            cv2.rectangle(canvas, (sx1, sy1), (sx2, sy2), col, 2)
+            label_y = max(sy1 - 6, y_off + 14)
+            cv2.putText(canvas, lbl, (sx1 + 4, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, col, 1, cv2.LINE_AA)
+            _draw_ann_overlay(ann_lines, sx1, label_y + 18, 0.40, 15)
 
     # --- in-progress drag rectangle (live preview while user is still dragging) ---
     drag_rect = canvas_meta.get("drag_rect")
@@ -741,6 +842,18 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         cv2.putText(canvas, "manual box", (rx1 + 4, max(ry1 - 6, y_off + 14)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
 
+    vp_cursor_line = canvas_meta.get("vehicle_cursor_line")
+    if vp_cursor_line is not None:
+        vx, vy1, vy2 = vp_cursor_line
+        cv2.line(canvas, (vx, vy1), (vx, vy2), (0, 235, 255), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (vx, vy2), 3, (0, 235, 255), -1, cv2.LINE_AA)
+
+    vp_drag_line = canvas_meta.get("vehicle_drag_line")
+    if vp_drag_line is not None:
+        vx, vy1, vy2 = vp_drag_line
+        cv2.line(canvas, (vx, vy1), (vx, vy2), (255, 255, 0), 2, cv2.LINE_AA)
+        cv2.circle(canvas, (vx, vy2), 4, (255, 255, 0), -1, cv2.LINE_AA)
+
     # Draw popup (shown only on the click frame while paused)
     if show_popup and annotation and popup_anchor is not None:
         popup_zones = draw_popup(
@@ -749,6 +862,7 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
             screen_w, screen_h,
         )
     _layout["popup_zones"] = popup_zones
+    _layout["vehicle_pos_line_zone"] = vehicle_line_zone
 
     # --- timeline ---
     cv2.rectangle(canvas, (0, timeline_y), (screen_w, screen_h), (20, 20, 20), -1)
@@ -1190,14 +1304,37 @@ def main():
                             if pcat in pstates:
                                 ann_lines.append((str(pstates[pcat]),
                                                   entry[2] if len(entry) > 2 else 'per_frame'))
-                    if pmode == "person":
+                    if pmode in ("person", "vehicle-pos"):
                         path_all = saved_tracks[pidx].get("_person_path_pts", [])
                         traj_points = [(mx, my) for (fn, mx, my) in path_all if fn <= current_frame]
-                    preview_boxes.append((px1, py1, px2, py2, plbl, pcol, ann_lines, traj_points))
+                    preview_boxes.append((px1, py1, px2, py2, plbl, pcol, ann_lines, traj_points, pmode))
 
         _dr = _state["drag_start"]
         _dc = _state["drag_current"]
         _drag_rect = (_dr[0], _dr[1], _dc[0], _dc[1]) if _dr and _dc else None
+
+        vp_cursor_line = None
+        hover_pos = _state.get("hover_pos")
+        if paused and polygon_confirmed and track_mode == "vehicle-pos" and hover_pos is not None:
+            hp = canvas_to_frame(hover_pos[0], hover_pos[1])
+            if hp is not None:
+                base_box = None
+                if current_frame in track_history:
+                    bx1h, by1h, bx2h, by2h, _, _, _ = track_history[current_frame]
+                    base_box = (bx1h, by1h, bx2h, by2h)
+                line_box = _vehicle_pos_box_from_anchor(hp, frame.shape, base_box=base_box)
+                vx = int(_layout["x_off"] + line_box[0] * _layout["scale"])
+                vy1 = int(_layout["y_off"] + line_box[1] * _layout["scale"])
+                vy2 = int(_layout["y_off"] + line_box[3] * _layout["scale"])
+                vp_cursor_line = (vx, vy1, vy2)
+
+        vp_drag_line = None
+        if _state.get("vp_drag_start") is not None and _state.get("vp_drag_line") is not None and _state.get("vp_drag_current") is not None:
+            sx, sy = _state["vp_drag_start"]
+            lx, ly1, ly2 = _state["vp_drag_line"]
+            cx, cy = _state["vp_drag_current"]
+            vp_drag_line = (lx + (cx - sx), ly1 + (cy - sy), ly2 + (cy - sy))
+
         canvas = build_canvas(frame, screen_w, screen_h,
                               current_frame, total_frames, fps, paused,
                               boxes, preview_boxes,
@@ -1213,6 +1350,8 @@ def main():
                                "video_name":     video_name,
                                "markers":        markers,
                                "drag_rect":      _drag_rect,
+                               "vehicle_cursor_line": vp_cursor_line,
+                               "vehicle_drag_line": vp_drag_line,
                                "polygon_points": display_polygon_points,
                                "polygon_drag_idx": drag_idx,
                                "polygon_setup":  not polygon_confirmed})
@@ -1272,6 +1411,37 @@ def main():
                 if polygon_confirmed:
                     save_all_annotations_to_json(video_path, saved_tracks, markers, polygon_points)
                 print(f"[polygon] moved point {drag_idx + 1}/{len(polygon_points)}")
+            continue
+
+        # --- vehicle-pos line drag end ---
+        if _state["vp_drag_end"] is not None:
+            lx, ly1, ly2 = _state["vp_drag_end"]
+            _state["vp_drag_end"] = None
+            fp_top = canvas_to_frame(lx, ly1)
+            fp_bot = canvas_to_frame(lx, ly2)
+            if fp_top is not None and fp_bot is not None and polygon_confirmed:
+                x1, y1 = fp_top
+                x2, y2 = fp_bot
+                line_x = int(round((x1 + x2) / 2.0))
+                by1, by2 = (y1, y2) if y1 <= y2 else (y2, y1)
+                if current_frame in track_history:
+                    _, _, _, _, _, _, cur_states = track_history[current_frame]
+                    use_states = dict(cur_states)
+                else:
+                    use_states = dict(track_states)
+                use_states = _apply_polygon_crosswalk_state(
+                    "vehicle-pos", use_states, (line_x, by1, line_x, by2), polygon_points)
+                track_mode = "vehicle-pos"
+                track_states = dict(use_states)
+                track_history[current_frame] = (line_x, by1, line_x, by2,
+                                                "vehicle-pos", "vehicle-pos", dict(track_states))
+                boxes = [(line_x, by1, line_x, by2, "vehicle-pos", TRACK_COLOR)]
+                tracked_id = None
+                cached_track_box = None
+                track_infer_tick = 0
+                tracked_label = "vehicle-pos"
+                paused = True
+                show_popup = True
             continue
 
         # --- sidebar click → track-list interaction ---
@@ -1357,16 +1527,27 @@ def main():
                         draw_states = dict(track_states)
                     draw_states = _apply_polygon_crosswalk_state(
                         draw_mode, draw_states, (fx1, fy1, fx2, fy2), polygon_points)
-                    draw_label  = draw_mode
-                    track_history[current_frame] = (fx1, fy1, fx2, fy2,
-                                                    draw_label, draw_mode, draw_states)
+                    if draw_mode == "vehicle-pos":
+                        line_x = int(round((fx1 + fx2) / 2.0))
+                        by1 = min(fy1, fy2)
+                        by2 = max(fy1, fy2)
+                        draw_states = _apply_polygon_crosswalk_state(
+                            draw_mode, draw_states, (line_x, by1, line_x, by2), polygon_points)
+                        draw_label = "vehicle-pos"
+                        track_history[current_frame] = (line_x, by1, line_x, by2,
+                                                        draw_label, draw_mode, draw_states)
+                        boxes = [(line_x, by1, line_x, by2, draw_label, TRACK_COLOR)]
+                    else:
+                        draw_label  = draw_mode
+                        track_history[current_frame] = (fx1, fy1, fx2, fy2,
+                                                        draw_label, draw_mode, draw_states)
+                        boxes         = [(fx1, fy1, fx2, fy2, draw_label, TRACK_COLOR)]
                     track_mode    = draw_mode
                     track_states  = dict(draw_states)
                     tracked_id    = None
                     cached_track_box = None
                     track_infer_tick = 0
                     tracked_label = draw_label
-                    boxes         = [(fx1, fy1, fx2, fy2, draw_label, TRACK_COLOR)]
                     paused        = True
                     show_popup    = True
                     print(f"[draw] manual box at frame {current_frame}  {fx1},{fy1}-{fx2},{fy2}")
@@ -1398,6 +1579,9 @@ def main():
                             # Rewrite current frame with new mode + mode-specific states
                             if current_frame in track_history:
                                 x1h,y1h,x2h,y2h,lblh,_,_ = track_history[current_frame]
+                                if track_mode == "vehicle-pos":
+                                    line_x = int(round((x1h + x2h) / 2.0))
+                                    x1h, x2h = line_x, line_x
                                 # label follows mode
                                 adj_states = _apply_polygon_crosswalk_state(
                                     track_mode, track_states, (x1h, y1h, x2h, y2h), polygon_points)
@@ -1432,12 +1616,37 @@ def main():
                     # (allows editing per_frame states frame-by-frame without re-detecting)
                     in_hist = (tracked_id is None and current_frame in track_history)
                     if in_hist:
-                        hx1, hy1, hx2, hy2, *_ = track_history[current_frame]
+                        hx1, hy1, hx2, hy2, _, hmode, _ = track_history[current_frame]
                         fx, fy = frame_pos
-                        if hx1 <= fx <= hx2 and hy1 <= fy <= hy2:
+                        if _point_hits_track_box(fx, fy, (hx1, hy1, hx2, hy2), hmode):
                             show_popup = True
                             hit_popup  = True
                     if not hit_popup:
+                        if track_mode == "vehicle-pos":
+                            prev_box = None
+                            prev_frames = sorted(f for f in track_history if f <= current_frame)
+                            if prev_frames:
+                                px1, py1, px2, py2, _, pmode, _ = track_history[prev_frames[-1]]
+                                if pmode == "vehicle-pos":
+                                    prev_box = (px1, py1, px2, py2)
+                            vx1, vy1, vx2, vy2 = _vehicle_pos_box_from_anchor(
+                                frame_pos, frame.shape, base_box=prev_box)
+                            manual_states = _apply_polygon_crosswalk_state(
+                                "vehicle-pos", dict(track_states),
+                                (vx1, vy1, vx2, vy2), polygon_points)
+                            track_mode = "vehicle-pos"
+                            track_states = dict(manual_states)
+                            track_history[current_frame] = (vx1, vy1, vx2, vy2,
+                                                            "vehicle-pos", "vehicle-pos",
+                                                            dict(track_states))
+                            boxes = [(vx1, vy1, vx2, vy2, "vehicle-pos", TRACK_COLOR)]
+                            tracked_id = None
+                            cached_track_box = None
+                            track_infer_tick = 0
+                            tracked_label = "vehicle-pos"
+                            paused = True
+                            show_popup = True
+                            continue
                         paused     = True
                         boxes, tracked_id, tracked_label = run_tracking(
                             model, frame, click_pos=frame_pos, do_log=True)
@@ -1486,6 +1695,24 @@ def main():
                 markers.sort(key=lambda mk: mk["frame"])
                 save_markers_to_json(video_path, markers, polygon_points)
                 print(f"[marker] added {mlabel} at frame {current_frame}")
+
+            elif key_ch in (ord('v'), ord('V')):       # V – manual vehicle-pos mode
+                last_states_per_mode[track_mode] = dict(track_states)
+                track_mode = "vehicle-pos"
+                track_states = dict(last_states_per_mode.get(
+                    track_mode, _default_track_states(track_mode)))
+                tracked_id = None
+                cached_track_box = None
+                track_infer_tick = 0
+                tracked_label = "vehicle-pos"
+                show_popup = False
+                paused = True
+                if current_frame in track_history:
+                    hx1, hy1, hx2, hy2, hlbl, hmode, hstates = track_history[current_frame]
+                    if hmode == "vehicle-pos":
+                        boxes = [(hx1, hy1, hx2, hy2, hlbl, HISTORY_COLOR)]
+                        track_states = dict(hstates)
+                print("[mode] vehicle-pos manual mode (click to place vertical line)")
 
             elif key_ch == 32:                         # Space – play/pause
                 paused     = not paused
