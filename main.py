@@ -66,14 +66,7 @@ TRACK_STATES = {
         ('interaction',           ['no interaction', 'honk', 'gap-find', 'gesture', 'verbal', 'eye-contact'],   'per_frame'),
         ('type',                  ['suv', 'truck', 'bus', 'sedan', 'van', 'pickup'],                            'per_track'),
         ('wait time',             ['just arrived', 'waited'],                                                   'per_track'),
-    ],
-    'vehicle-pos': [
-        ('movement',              ['turning', 'waiting'],                                                       'per_frame'),
-        ('position',              ['outside crosswalk', 'inside crosswalk'],                                    'per_frame'),
-        ('interaction',           ['no interaction', 'honk', 'gap-find', 'gesture', 'verbal', 'eye-contact'],   'per_frame'),
-        ('type',                  ['suv', 'truck', 'bus', 'sedan', 'van', 'pickup'],                            'per_track'),
-        ('wait time',             ['just arrived', 'waited'],                                                   'per_track'),
-    ],
+    ]
 }
 
 # Popup appearance
@@ -110,6 +103,16 @@ HISTORY_COLOR = (80, 150, 255)  # blue   – historical (seeked-to) box
 DIM_COLOR     = (160, 160, 160) # grey   – "showing all" fallback detections
 POLY_COLOR    = (0, 255, 255)   # yellow – crosswalk polygon
 POLY_TMP_COLOR= (0, 180, 255)   # orange – in-progress polygon
+POLY_EDGE_COLORS = [
+    (0, 255, 255),   # side 1
+    (0, 200, 120),   # side 2
+    (255, 120, 0),   # side 3
+    (220, 80, 220),  # side 4
+]
+POLY_DIAG_COLORS = [
+    (120, 220, 255),  # diagonal 1
+    (255, 180, 120),  # diagonal 2
+]
 
 # Shared mutable state (written by mouse callback, read by main loop)
 _state = {
@@ -353,10 +356,285 @@ def _refresh_saved_track_polygon(track_dict, polygon_points):
     track_dict["_person_path_pts"] = build_person_path_points(track_dict)
 
 
+def _polygon_edge_lengths_from_points(polygon_points):
+    if len(polygon_points) != 4:
+        return [0.0, 0.0, 0.0, 0.0]
+    out = []
+    for i in range(4):
+        ax, ay = polygon_points[i]
+        bx, by = polygon_points[(i + 1) % 4]
+        out.append(float(np.hypot(float(bx - ax), float(by - ay))))
+    return out
+
+
+def _circle_intersections(c0, r0, c1, r1):
+    x0, y0 = float(c0[0]), float(c0[1])
+    x1, y1 = float(c1[0]), float(c1[1])
+    r0 = float(r0)
+    r1 = float(r1)
+    dx = x1 - x0
+    dy = y1 - y0
+    d = float(np.hypot(dx, dy))
+    if d < 1e-6:
+        return []
+    if d > r0 + r1 + 1e-6:
+        return []
+    if d < abs(r0 - r1) - 1e-6:
+        return []
+    a = (r0 * r0 - r1 * r1 + d * d) / (2.0 * d)
+    h2 = r0 * r0 - a * a
+    if h2 < 0:
+        if h2 > -1e-6:
+            h2 = 0.0
+        else:
+            return []
+    h = float(np.sqrt(h2))
+    xm = x0 + a * dx / d
+    ym = y0 + a * dy / d
+    rx = -dy * (h / d)
+    ry = dx * (h / d)
+    p1 = np.array([xm + rx, ym + ry], dtype=np.float32)
+    p2 = np.array([xm - rx, ym - ry], dtype=np.float32)
+    if np.allclose(p1, p2, atol=1e-6):
+        return [p1]
+    return [p1, p2]
+
+
+def _polygon_projection_geometry(edge_lengths, diag_lengths, rot_deg=0.0,
+                                 flip=False, reflect_h=False, reflect_v=False):
+    """Build quadrilateral from 4 sides + 2 diagonals, centered at origin."""
+    if not edge_lengths or len(edge_lengths) != 4:
+        return None
+    if not diag_lengths or len(diag_lengths) != 2:
+        return None
+    try:
+        s1, s2, s3, s4 = [max(1e-3, float(v)) for v in edge_lengths]
+        d1, d2 = [max(1e-3, float(v)) for v in diag_lengths]
+    except Exception:
+        return None
+
+    a = np.array([0.0, 0.0], dtype=np.float32)
+    b = np.array([s1, 0.0], dtype=np.float32)
+
+    cands_c = _circle_intersections(a, d1, b, s2)
+    if not cands_c:
+        return None
+
+    quads = []
+    for c in cands_c:
+        cands_d = _circle_intersections(a, s4, c, s3)
+        for d in cands_d:
+            err = abs(float(np.hypot(*(d - b))) - d2)
+            quads.append((err, np.array([a, b, c, d], dtype=np.float32)))
+    if not quads:
+        return None
+    quads.sort(key=lambda t: t[0])
+    quad = quads[1][1] if (flip and len(quads) > 1) else quads[0][1]
+
+    quad = quad - quad.mean(axis=0)
+    if reflect_h:
+        quad[:, 0] *= -1.0
+    if reflect_v:
+        quad[:, 1] *= -1.0
+
+    rot_rad = float(np.deg2rad(rot_deg))
+    ca = float(np.cos(rot_rad))
+    sa = float(np.sin(rot_rad))
+    rmat = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
+    quad = (quad @ rmat.T).astype(np.float32)
+    return quad
+
+
+def _project_person_midpoints(track_history, current_frame, saved_tracks, previewed_idxs=None):
+    traces = []
+    supported_modes = ("person", "vehicle-pos")
+
+    # Only keep projected trace while the corresponding supported track is visible now.
+    if current_frame in track_history and track_history[current_frame][5] in supported_modes:
+        cur_pts = []
+        for fn in sorted(track_history.keys()):
+            if fn > current_frame:
+                continue
+            x1, y1, x2, y2, _, mode, _ = track_history[fn]
+            if mode in supported_modes:
+                if mode == "vehicle-pos":
+                    cur_pts.append((float(x1), float(y2)))
+                else:
+                    cur_pts.append((float((x1 + x2) / 2.0), float(y2)))
+        if cur_pts:
+            traces.append(cur_pts)
+
+    idxs = sorted(previewed_idxs) if previewed_idxs is not None else range(len(saved_tracks))
+    for i in idxs:
+        if i < 0 or i >= len(saved_tracks):
+            continue
+        tr = saved_tracks[i]
+        lu = tr.get("_frame_lookup", {})
+        if current_frame not in lu or lu[current_frame][5] not in supported_modes:
+            continue
+        t_pts = []
+        for fn in sorted(lu.keys()):
+            if fn > current_frame:
+                continue
+            x1, y1, x2, y2, _, mode, _ = lu[fn]
+            if mode not in supported_modes:
+                continue
+            if mode == "vehicle-pos":
+                t_pts.append((float(x1), float(y2)))
+            else:
+                t_pts.append((float((x1 + x2) / 2.0), float(y2)))
+        if t_pts:
+            traces.append(t_pts)
+    return traces
+
+
+def _compute_track_projection(track_dict, polygon_points, edge_lengths, diag_lengths, 
+                               rot_deg, flip, reflect_h, reflect_v):
+    """Compute projected traces for a saved track in meters.
+    
+    Returns:
+        dict with keys: "polygon_projection" (metadata), "projected_traces" (list of traces)
+        or None if projection cannot be computed.
+    """
+    if not polygon_points or len(polygon_points) < 4:
+        return None
+    
+    geom = _polygon_projection_geometry(
+        edge_lengths, diag_lengths,
+        rot_deg=rot_deg, flip=flip, reflect_h=reflect_h, reflect_v=reflect_v,
+    )
+    if geom is None:
+        return None
+    
+    src = np.array(polygon_points[:4], dtype=np.float32)
+    dst = geom.astype(np.float32)
+    try:
+        hmat = cv2.getPerspectiveTransform(src, dst)
+    except Exception:
+        return None
+    
+    # Extract supported traces (person + vehicle-pos) from track
+    frame_lookup = track_dict.get("_frame_lookup", {})
+    traces = []
+    trace_pts = []
+    supported_modes = ("person", "vehicle-pos")
+    for fn in sorted(frame_lookup.keys()):
+        x1, y1, x2, y2, _, mode, _ = frame_lookup[fn]
+        if mode in supported_modes:
+            if mode == "vehicle-pos":
+                trace_pts.append((float(x1), float(y2)))
+            else:
+                trace_pts.append((float((x1 + x2) / 2.0), float(y2)))
+        else:
+            if trace_pts:
+                if len(trace_pts) > 0:
+                    arr = np.array(trace_pts, dtype=np.float32).reshape(-1, 1, 2)
+                    proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)
+                    traces.append([tuple(map(float, p)) for p in proj])
+                trace_pts = []
+    # Don't forget the last trace
+    if trace_pts:
+        arr = np.array(trace_pts, dtype=np.float32).reshape(-1, 1, 2)
+        proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)
+        traces.append([tuple(map(float, p)) for p in proj])
+    
+    return {
+        "polygon_projection": {
+            "polygon_vertices": [tuple(map(float, p)) for p in dst],
+            "edge_lengths_meters": edge_lengths,
+            "diagonal_lengths_meters": diag_lengths,
+            "rotation_degrees": rot_deg,
+            "flip": flip,
+            "reflect_horizontal": reflect_h,
+            "reflect_vertical": reflect_v,
+            "origin_note": "center of polygon at (0, 0)",
+        },
+        "projected_traces": traces,
+    }
+
+
+def _compute_projected_frame_points(frame_lookup, polygon_points, edge_lengths, diag_lengths,
+                                    rot_deg, flip, reflect_h, reflect_v):
+    """Project per-frame person/vehicle-pos coordinates into the normalized polygon space.
+
+    Returns (projected_polygon, projected_points_by_frame) where projected_points_by_frame
+    maps frame number -> [x, y] in the projected coordinate system.
+    """
+    if not polygon_points or len(polygon_points) < 4:
+        return None, {}
+
+    geom = _polygon_projection_geometry(
+        edge_lengths,
+        diag_lengths,
+        rot_deg=rot_deg,
+        flip=flip,
+        reflect_h=reflect_h,
+        reflect_v=reflect_v,
+    )
+    if geom is None:
+        return None, {}
+
+    src = np.array(polygon_points[:4], dtype=np.float32)
+    dst = geom.astype(np.float32)
+    try:
+        hmat = cv2.getPerspectiveTransform(src, dst)
+    except Exception:
+        return None, {}
+
+    projected_points = {}
+    for fn in sorted(frame_lookup.keys()):
+        x1, y1, x2, y2, _, mode, _ = frame_lookup[fn]
+        if mode not in ("person", "vehicle-pos"):
+            continue
+        px = float(x1) if mode == "vehicle-pos" else float(x1 + x2) / 2.0
+        arr = np.array([[(px), float(y2)]], dtype=np.float32).reshape(-1, 1, 2)
+        proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)[0]
+        projected_points[int(fn)] = [float(proj[0]), float(proj[1])]
+
+    return [tuple(map(float, p)) for p in dst], projected_points
+
+
+def _compute_projection_overlay_data(polygon_points, edge_lengths, diag_lengths, rot_deg,
+                                     flip, reflect_h, reflect_v,
+                                     track_history, current_frame, saved_tracks,
+                                     previewed_idxs):
+    geom = _polygon_projection_geometry(
+        edge_lengths,
+        diag_lengths,
+        rot_deg=rot_deg,
+        flip=flip,
+        reflect_h=reflect_h,
+        reflect_v=reflect_v,
+    )
+    if geom is None:
+        return None
+    src = np.array(polygon_points, dtype=np.float32)
+    dst = geom.astype(np.float32)
+    try:
+        hmat = cv2.getPerspectiveTransform(src, dst)
+    except Exception:
+        return None
+
+    out_traces = []
+    traces = _project_person_midpoints(
+        track_history, current_frame, saved_tracks, previewed_idxs=previewed_idxs)
+    for pts in traces:
+        arr = np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
+        proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)
+        out_traces.append([tuple(map(float, p)) for p in proj])
+
+    return {
+        "poly": [tuple(map(float, p)) for p in dst],
+        "traces": out_traces,
+    }
+
+
 def _serialize_track_dict(track_dict):
     out = {}
     for key, value in track_dict.items():
         if key.startswith("_"):
+            continue
+        if key == "projected_track":
             continue
         if key == "frames":
             out[key] = [dict(frame) for frame in value]
@@ -367,13 +645,28 @@ def _serialize_track_dict(track_dict):
     return out
 
 
-def save_all_annotations_to_json(video_path, saved_tracks, markers, polygon=None):
+def save_all_annotations_to_json(video_path, saved_tracks, markers, polygon=None,
+                                 polygon_edge_lengths=None,
+                                 polygon_diagonal_lengths=None,
+                                 projected_polygon=None):
     outpath = _markers_path(video_path)
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
+    old_projected_polygon = []
+    if os.path.isfile(outpath):
+        try:
+            with open(outpath, "r") as f:
+                _raw = json.load(f)
+            if isinstance(_raw, dict):
+                old_projected_polygon = _raw.get("projected_polygon", [])
+        except Exception:
+            old_projected_polygon = []
     out_doc = {
         "tracks": [_serialize_track_dict(track) for track in saved_tracks],
         "markers": markers,
         "polygon": polygon or [],
+        "polygon_edge_lengths": polygon_edge_lengths or [],
+        "polygon_diagonal_lengths": polygon_diagonal_lengths or [],
+        "projected_polygon": projected_polygon if projected_polygon is not None else old_projected_polygon,
     }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
@@ -399,6 +692,66 @@ def draw_smooth_polyline(canvas, frame_pts, x_off, y_off, scale, color, thicknes
         arr = sm
 
     cv2.polylines(canvas, [arr.astype(np.int32)], False, color, thickness, cv2.LINE_AA)
+
+
+def _draw_projection_overlay(canvas, overlay_data, edge_colors, alpha=0.75):
+    if overlay_data is None:
+        return
+    poly = overlay_data.get("poly", [])
+    traces = overlay_data.get("traces", [])
+    if len(poly) != 4:
+        return
+
+    h, w = canvas.shape[:2]
+    x1 = max(SIDEBAR_W + 12, int(w * 0.58))
+    x2 = w - 12
+    y1 = 12
+    y2 = int(h * 0.55)
+    if x2 - x1 < 120 or y2 - y1 < 120:
+        return
+
+    panel = canvas.copy()
+    cv2.rectangle(panel, (x1, y1), (x2, y2), (12, 12, 12), -1)
+    cv2.rectangle(panel, (x1, y1), (x2, y2), (70, 70, 70), 1)
+
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    cv2.line(panel, (x1 + 10, cy), (x2 - 10, cy), (100, 100, 100), 1, cv2.LINE_AA)
+    cv2.line(panel, (cx, y1 + 10), (cx, y2 - 10), (100, 100, 100), 1, cv2.LINE_AA)
+    cv2.putText(panel, "X", (x2 - 20, cy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(panel, "Y", (cx + 6, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (180, 180, 180), 1, cv2.LINE_AA)
+
+    arr = np.array(poly, dtype=np.float32)
+    max_x = max(float(np.max(np.abs(arr[:, 0]))), 1e-3)
+    max_y = max(float(np.max(np.abs(arr[:, 1]))), 1e-3)
+    fit_x = (x2 - x1 - 30) / (2.0 * max_x)
+    fit_y = (y2 - y1 - 30) / (2.0 * max_y)
+    sf = max(1e-6, min(fit_x, fit_y))
+
+    def _to_panel(pt):
+        px = int(round(cx + float(pt[0]) * sf))
+        py = int(round(cy - float(pt[1]) * sf))
+        return px, py
+
+    poly_canvas = [_to_panel(p) for p in poly]
+    for i in range(4):
+        a = poly_canvas[i]
+        b = poly_canvas[(i + 1) % 4]
+        col = edge_colors[i % len(edge_colors)]
+        cv2.line(panel, a, b, col, 2, cv2.LINE_AA)
+    cv2.line(panel, poly_canvas[0], poly_canvas[2], POLY_DIAG_COLORS[0], 1, cv2.LINE_AA)
+    cv2.line(panel, poly_canvas[1], poly_canvas[3], POLY_DIAG_COLORS[1], 1, cv2.LINE_AA)
+
+    for idx, tr in enumerate(traces):
+        if len(tr) < 2:
+            continue
+        tr_arr = np.array([_to_panel(p) for p in tr], dtype=np.int32)
+        col = PREVIEW_COLORS[idx % len(PREVIEW_COLORS)]
+        cv2.polylines(panel, [tr_arr], False, col, 2, cv2.LINE_AA)
+
+    cv2.addWeighted(panel, alpha, canvas, 1.0 - alpha, 0.0, dst=canvas)
 
 
 def draw_popup(canvas, anchor_x, anchor_y, track_mode, track_states, screen_w, screen_h):
@@ -648,6 +1001,86 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
     _layout["track_list_zones"] = track_list_zones
     sb_divider(sy); sy += 8
 
+    # ---- Polygon edge lengths ----
+    polygon_edge_lengths = canvas_meta.get("polygon_edge_lengths", [0.0, 0.0, 0.0, 0.0])
+    polygon_diag_lengths = canvas_meta.get("polygon_diag_lengths", [0.0, 0.0])
+    polygon_len_edit_idx = canvas_meta.get("polygon_len_edit_idx")
+    polygon_len_edit_text = canvas_meta.get("polygon_len_edit_text", "")
+    polygon_length_zones = []
+
+    sb_line("POLY LENGTHS", F_HDR, (160, 210, 255), bold=True, gap=5)
+    poly_fields = [
+        ("L1", 0, "edge", POLY_EDGE_COLORS[0]),
+        ("L2", 1, "edge", POLY_EDGE_COLORS[1]),
+        ("L3", 2, "edge", POLY_EDGE_COLORS[2]),
+        ("L4", 3, "edge", POLY_EDGE_COLORS[3]),
+        ("D1", 0, "diag", POLY_DIAG_COLORS[0]),
+        ("D2", 1, "diag", POLY_DIAG_COLORS[1]),
+    ]
+    for i, (tag, val_idx, kind, col) in enumerate(poly_fields):
+        ly1 = sy
+        ly2 = sy + MRK_ROW_H
+        cv2.rectangle(canvas, (PAD, ly1 + 4), (PAD + 10, ly2 - 4), col, -1)
+        field_x1 = PAD + 16
+        field_x2 = SIDEBAR_W - PAD - 2
+        bg = (50, 60, 75) if i == polygon_len_edit_idx else (34, 34, 34)
+        bd = (95, 125, 170) if i == polygon_len_edit_idx else (70, 70, 70)
+        cv2.rectangle(canvas, (field_x1, ly1 + 2), (field_x2, ly2 - 2), bg, -1)
+        cv2.rectangle(canvas, (field_x1, ly1 + 2), (field_x2, ly2 - 2), bd, 1)
+        if i == polygon_len_edit_idx:
+            val_txt = polygon_len_edit_text if polygon_len_edit_text else "0"
+        else:
+            src = polygon_edge_lengths[val_idx] if kind == "edge" else polygon_diag_lengths[val_idx]
+            val_txt = f"{float(src):.2f}"
+        cv2.putText(canvas, f"{tag}: {val_txt}",
+                    (field_x1 + 4, _cy(ly1, MRK_ROW_H, F_ROW)),
+                    cv2.FONT_HERSHEY_SIMPLEX, F_ROW, (210, 210, 210), 1, cv2.LINE_AA)
+        polygon_length_zones.append({
+            "type": "poly_len_field",
+            "idx": i,
+            "kind": kind,
+            "val_idx": val_idx,
+            "x1": field_x1,
+            "x2": field_x2,
+            "y1": ly1,
+            "y2": ly2,
+        })
+        sy += MRK_ROW_H
+
+    save_y1 = sy
+    save_y2 = sy + BTN_H
+    cv2.rectangle(canvas, (1, save_y1), (SIDEBAR_W - 1, save_y2), (35, 60, 35), -1)
+    cv2.rectangle(canvas, (1, save_y1), (SIDEBAR_W - 1, save_y2), (80, 130, 80), 1)
+    cv2.putText(canvas, "save lengths", (PAD, _cy(save_y1, BTN_H, F_BTN)),
+                cv2.FONT_HERSHEY_SIMPLEX, F_BTN, (130, 220, 130), 1, cv2.LINE_AA)
+    polygon_length_zones.append({
+        "type": "poly_len_save",
+        "x1": 1,
+        "x2": SIDEBAR_W - 1,
+        "y1": save_y1,
+        "y2": save_y2,
+    })
+    sy += BTN_H + 4
+    
+    # Save all projections button
+    proj_y1 = sy
+    proj_y2 = sy + BTN_H
+    cv2.rectangle(canvas, (1, proj_y1), (SIDEBAR_W - 1, proj_y2), (40, 50, 70), -1)
+    cv2.rectangle(canvas, (1, proj_y1), (SIDEBAR_W - 1, proj_y2), (100, 130, 180), 1)
+    cv2.putText(canvas, "save all proj", (PAD, _cy(proj_y1, BTN_H, F_BTN)),
+                cv2.FONT_HERSHEY_SIMPLEX, F_BTN, (150, 190, 255), 1, cv2.LINE_AA)
+    polygon_length_zones.append({
+        "type": "poly_save_all_proj",
+        "x1": 1,
+        "x2": SIDEBAR_W - 1,
+        "y1": proj_y1,
+        "y2": proj_y2,
+    })
+    sy += BTN_H + 4
+    
+    _layout["polygon_length_zones"] = polygon_length_zones
+    sb_divider(sy); sy += 8
+
     # ---- Markers ----
     markers_list = canvas_meta.get("markers", [])
 
@@ -680,6 +1113,11 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         ("[BKSP] clear",         (200, 80, 80)),
         ("[A+BKSP] del before",  (200, 140, 60)),
         ("[S+A+BKSP] del after", (200, 140, 60)),
+        ("[P] projection",       (160, 210, 255)),
+        ("[O] rotate projection",(160, 210, 255)),
+        ("[F] flip solution",    (160, 210, 255)),
+        ("[H] reflect H",        (160, 210, 255)),
+        ("[v] reflect V",        (160, 210, 255)),
         ("[V] vehicle-pos",      (140, 180, 220)),
         ("[click] detect",       (140, 140, 140)),
         ("[drag] draw box",      (210, 210, 50)),
@@ -715,11 +1153,13 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         p_canvas = [(int(x_off + px * scale), int(y_off + py * scale))
                     for (px, py) in polygon_points]
         if len(p_canvas) >= 2:
-            draw_col = POLY_COLOR if len(p_canvas) == 4 else POLY_TMP_COLOR
             for i in range(len(p_canvas) - 1):
-                cv2.line(canvas, p_canvas[i], p_canvas[i + 1], draw_col, 2, cv2.LINE_AA)
+                seg_col = POLY_EDGE_COLORS[i % len(POLY_EDGE_COLORS)] if len(p_canvas) == 4 else POLY_TMP_COLOR
+                cv2.line(canvas, p_canvas[i], p_canvas[i + 1], seg_col, 2, cv2.LINE_AA)
             if len(p_canvas) == 4:
-                cv2.line(canvas, p_canvas[-1], p_canvas[0], POLY_COLOR, 2, cv2.LINE_AA)
+                cv2.line(canvas, p_canvas[-1], p_canvas[0], POLY_EDGE_COLORS[3], 2, cv2.LINE_AA)
+                cv2.line(canvas, p_canvas[0], p_canvas[2], POLY_DIAG_COLORS[0], 1, cv2.LINE_AA)
+                cv2.line(canvas, p_canvas[1], p_canvas[3], POLY_DIAG_COLORS[1], 1, cv2.LINE_AA)
         for idx, p in enumerate(p_canvas):
             radius = 8 if idx == polygon_drag_idx else 6
             fill = (0, 200, 255) if idx == polygon_drag_idx else POLY_COLOR
@@ -864,6 +1304,14 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
     _layout["popup_zones"] = popup_zones
     _layout["vehicle_pos_line_zone"] = vehicle_line_zone
 
+    if canvas_meta.get("show_projection_overlay", False):
+        _draw_projection_overlay(
+            canvas,
+            canvas_meta.get("projection_overlay_data"),
+            POLY_EDGE_COLORS,
+            alpha=0.78,
+        )
+
     # --- timeline ---
     cv2.rectangle(canvas, (0, timeline_y), (screen_w, screen_h), (20, 20, 20), -1)
     cv2.line(canvas, (0, timeline_y), (screen_w, timeline_y), (55, 55, 55), 1)
@@ -966,24 +1414,36 @@ def save_markers_to_json(video_path, markers, polygon=None):
         if isinstance(_raw, dict):
             all_tracks = _raw.get("tracks", [])
             old_polygon = _raw.get("polygon", [])
+            old_lengths = _raw.get("polygon_edge_lengths", [])
+            old_diags = _raw.get("polygon_diagonal_lengths", [])
         else:
             all_tracks = _raw
             old_polygon = []
+            old_lengths = []
+            old_diags = []
     else:
         all_tracks = []
         old_polygon = []
+        old_lengths = []
+        old_diags = []
     out_doc = {
         "tracks": all_tracks,
         "markers": markers,
         "polygon": polygon if polygon is not None else old_polygon,
+        "polygon_edge_lengths": old_lengths,
+        "polygon_diagonal_lengths": old_diags,
     }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
 
 
-def save_track_to_json(video_path, track_history, fps, markers=None, polygon=None):
+def save_track_to_json(video_path, track_history, fps, markers=None, polygon=None,
+                       polygon_edge_lengths=None, polygon_diagonal_lengths=None,
+                       projection_rot_deg=None, projection_flip=None, 
+                       projection_reflect_h=None, projection_reflect_v=None):
     """Append the current track (with per-frame mode+states) to the JSON file.
-    Saves markers alongside tracks. Returns the saved track dict.
+    Saves markers alongside tracks. Optionally includes projected track data in meters.
+    Returns the saved track dict.
     """
     outpath = _markers_path(video_path)
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
@@ -994,12 +1454,21 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
         if isinstance(_raw, dict):
             all_tracks = _raw.get("tracks", [])
             old_polygon = _raw.get("polygon", [])
+            old_lengths = _raw.get("polygon_edge_lengths", [])
+            old_diags = _raw.get("polygon_diagonal_lengths", [])
+            old_projected_polygon = _raw.get("projected_polygon", [])
         else:
             all_tracks = _raw   # migrate old format
             old_polygon = []
+            old_lengths = []
+            old_diags = []
+            old_projected_polygon = []
     else:
         all_tracks = []
         old_polygon = []
+        old_lengths = []
+        old_diags = []
+        old_projected_polygon = []
 
     frames_data = []
     for frame_num in sorted(track_history.keys()):
@@ -1040,18 +1509,131 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
         "frame_count":  len(frames_data),
         "frames":       frames_data,
     }
+    
+    projected_polygon = None
+    use_proj = (polygon is not None and len(polygon) >= 4 and 
+                polygon_edge_lengths and len(polygon_edge_lengths) >= 4 and
+                polygon_diagonal_lengths and len(polygon_diagonal_lengths) >= 2 and
+                projection_rot_deg is not None and projection_flip is not None and
+                projection_reflect_h is not None and projection_reflect_v is not None)
+    
+    if use_proj:
+        frame_lookup = {}
+        for frame_data in frames_data:
+            fn = frame_data["frame_num"]
+            x1, y1, x2, y2, label, fmode, fstates = track_history[fn]
+            frame_lookup[fn] = (x1, y1, x2, y2, label, fmode, fstates)
+
+        projected_polygon, projected_points = _compute_projected_frame_points(
+            frame_lookup,
+            polygon,
+            polygon_edge_lengths[:4],
+            polygon_diagonal_lengths[:2],
+            projection_rot_deg,
+            projection_flip,
+            projection_reflect_h,
+            projection_reflect_v,
+        )
+        if projected_points:
+            for frame_data in frames_data:
+                proj_point = projected_points.get(frame_data["frame_num"])
+                if proj_point is not None:
+                    frame_data["projected_point"] = proj_point
+    
     all_tracks.append(track_dict)
 
     out_doc = {
         "tracks": all_tracks,
         "markers": markers or [],
         "polygon": polygon if polygon is not None else old_polygon,
+        "polygon_edge_lengths": (
+            polygon_edge_lengths
+            if polygon_edge_lengths is not None else old_lengths
+        ),
+        "polygon_diagonal_lengths": (
+            polygon_diagonal_lengths
+            if polygon_diagonal_lengths is not None else old_diags
+        ),
+        "projected_polygon": projected_polygon if projected_polygon is not None else old_projected_polygon,
     }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
 
     print(f"[save] {len(frames_data)} frames  →  {outpath}")
     return track_dict
+
+
+def apply_projections_to_all_tracks(video_path, saved_tracks, polygon, polygon_edge_lengths,
+                                    polygon_diagonal_lengths, rot_deg, flip, reflect_h, reflect_v):
+    """Apply/update projections for all saved tracks and persist to JSON.
+    
+    Retroactively computes projected track data for all saved tracks using current projection
+    parameters, and saves them to the JSON file.
+    
+    Returns: True if successful, False otherwise.
+    """
+    if not polygon or len(polygon) < 4:
+        print("[proj] Invalid polygon, cannot apply projections")
+        return False
+    
+    if not (polygon_edge_lengths and len(polygon_edge_lengths) >= 4 and
+            polygon_diagonal_lengths and len(polygon_diagonal_lengths) >= 2):
+        print("[proj] Missing or incomplete edge/diagonal lengths")
+        return False
+    
+    outpath = _markers_path(video_path)
+    try:
+        with open(outpath) as f:
+            doc = json.load(f)
+    except Exception as e:
+        print(f"[proj] Failed to read JSON: {e}")
+        return False
+    
+    all_tracks = doc.get("tracks", [])
+    projected_polygon = None
+    updated_count = 0
+    
+    for i, track in enumerate(all_tracks):
+        frame_lookup = {}
+        for fd in track.get("frames", []):
+            fn = fd["frame_num"]
+            x1, y1, x2, y2 = fd["box"]
+            label = fd.get("label", "")
+            mode = fd.get("mode", "")
+            states = fd.get("states", {})
+            frame_lookup[fn] = (x1, y1, x2, y2, label, mode, states)
+
+        projected_polygon, projected_points = _compute_projected_frame_points(
+            frame_lookup,
+            polygon,
+            polygon_edge_lengths[:4],
+            polygon_diagonal_lengths[:2],
+            rot_deg,
+            flip,
+            reflect_h,
+            reflect_v,
+        )
+
+        if projected_points:
+            for fd in track.get("frames", []):
+                proj_point = projected_points.get(fd["frame_num"])
+                if proj_point is not None:
+                    fd["projected_point"] = proj_point
+            updated_count += 1
+
+        if "projected_track" in track:
+            del track["projected_track"]
+    
+    # Save back to JSON
+    try:
+        doc["projected_polygon"] = projected_polygon if projected_polygon is not None else doc.get("projected_polygon", [])
+        with open(outpath, "w") as f:
+            json.dump(doc, f, indent=2)
+        print(f"[proj] Applied projections to {updated_count}/{len(all_tracks)} tracks → {outpath}")
+        return True
+    except Exception as e:
+        print(f"[proj] Failed to save JSON: {e}")
+        return False
 
 
 def reset_botsort(model):
@@ -1225,7 +1807,16 @@ def main():
     track_infer_tick = 0      # increments during live playback while locked
     cached_track_box = None   # (x1,y1,x2,y2,label) reused between infer ticks
     polygon_points  = []     # list of 4 (x, y) points in frame coordinates
+    polygon_edge_lengths = [0.0, 0.0, 0.0, 0.0]
+    polygon_diag_lengths = [0.0, 0.0]
+    polygon_len_edit_idx = None
+    polygon_len_edit_text = ""
     polygon_confirmed = False
+    show_projection_overlay = False
+    projection_rotation_deg = 0.0
+    projection_flip = False
+    projection_reflect_h = False
+    projection_reflect_v = False
     video_name      = os.path.basename(video_path)
 
     # Load existing tracks from JSON on startup
@@ -1239,10 +1830,14 @@ def main():
                 _tracks_raw  = _loaded.get("tracks", [])
                 _markers_raw = _loaded.get("markers", [])
                 _polygon_raw = _loaded.get("polygon", [])
+                _edge_raw    = _loaded.get("polygon_edge_lengths", [])
+                _diag_raw    = _loaded.get("polygon_diagonal_lengths", [])
             else:
                 _tracks_raw  = _loaded
                 _markers_raw = []
                 _polygon_raw = []
+                _edge_raw    = []
+                _diag_raw    = []
             for _td in _tracks_raw:
                 _td["_frame_lookup"] = build_frame_lookup(_td)
                 _td["_person_path_pts"] = build_person_path_points(_td)
@@ -1259,6 +1854,24 @@ def main():
             if len(polygon_points) > 4:
                 polygon_points = polygon_points[:4]
             polygon_confirmed = (len(polygon_points) == 4)
+            if isinstance(_edge_raw, list) and len(_edge_raw) == 4:
+                try:
+                    polygon_edge_lengths = [max(0.0, float(v)) for v in _edge_raw]
+                except Exception:
+                    polygon_edge_lengths = [0.0, 0.0, 0.0, 0.0]
+            elif polygon_confirmed:
+                polygon_edge_lengths = _polygon_edge_lengths_from_points(polygon_points)
+            if isinstance(_diag_raw, list) and len(_diag_raw) == 2:
+                try:
+                    polygon_diag_lengths = [max(0.0, float(v)) for v in _diag_raw]
+                except Exception:
+                    polygon_diag_lengths = [0.0, 0.0]
+            elif polygon_confirmed and all(v <= 0 for v in polygon_diag_lengths):
+                p = np.array(polygon_points, dtype=np.float32)
+                polygon_diag_lengths = [
+                    float(np.hypot(*(p[2] - p[0]))),
+                    float(np.hypot(*(p[3] - p[1]))),
+                ]
             print(f"[load] {len(saved_tracks)} tracks, {len(markers)} markers loaded")
             if polygon_confirmed:
                 print("[load] crosswalk polygon loaded")
@@ -1335,6 +1948,22 @@ def main():
             cx, cy = _state["vp_drag_current"]
             vp_drag_line = (lx + (cx - sx), ly1 + (cy - sy), ly2 + (cy - sy))
 
+        projection_overlay_data = None
+        if show_projection_overlay and polygon_confirmed:
+            projection_overlay_data = _compute_projection_overlay_data(
+                polygon_points,
+                polygon_edge_lengths,
+                polygon_diag_lengths,
+                projection_rotation_deg,
+                projection_flip,
+                projection_reflect_h,
+                projection_reflect_v,
+                track_history,
+                current_frame,
+                saved_tracks,
+                previewed_idxs,
+            )
+
         canvas = build_canvas(frame, screen_w, screen_h,
                               current_frame, total_frames, fps, paused,
                               boxes, preview_boxes,
@@ -1353,8 +1982,14 @@ def main():
                                "vehicle_cursor_line": vp_cursor_line,
                                "vehicle_drag_line": vp_drag_line,
                                "polygon_points": display_polygon_points,
+                               "polygon_edge_lengths": polygon_edge_lengths,
+                               "polygon_diag_lengths": polygon_diag_lengths,
+                               "polygon_len_edit_idx": polygon_len_edit_idx,
+                               "polygon_len_edit_text": polygon_len_edit_text,
                                "polygon_drag_idx": drag_idx,
-                               "polygon_setup":  not polygon_confirmed})
+                               "polygon_setup":  not polygon_confirmed,
+                               "show_projection_overlay": show_projection_overlay,
+                               "projection_overlay_data": projection_overlay_data})
         cv2.imshow(WINDOW_NAME, canvas)
 
         wait_ms = 30 if paused else max(
@@ -1409,7 +2044,10 @@ def main():
                     track_states = _apply_polygon_crosswalk_state(
                         track_mode, track_states, (x1b, y1b, x2b, y2b), polygon_points)
                 if polygon_confirmed:
-                    save_all_annotations_to_json(video_path, saved_tracks, markers, polygon_points)
+                    save_all_annotations_to_json(
+                        video_path, saved_tracks, markers, polygon_points,
+                        polygon_edge_lengths=polygon_edge_lengths,
+                        polygon_diagonal_lengths=polygon_diag_lengths)
                 print(f"[polygon] moved point {drag_idx + 1}/{len(polygon_points)}")
             continue
 
@@ -1451,6 +2089,55 @@ def main():
                 continue
             scx, scy = _state["sidebar_click"]
             _state["sidebar_click"] = None
+
+            sidebar_handled = False
+            for zone in _layout.get("polygon_length_zones", []):
+                if not (zone["y1"] <= scy <= zone["y2"] and zone["x1"] <= scx <= zone["x2"]):
+                    continue
+                if zone["type"] == "poly_len_field":
+                    polygon_len_edit_idx = zone["idx"]
+                    if zone.get("kind") == "diag":
+                        polygon_len_edit_text = f"{float(polygon_diag_lengths[zone.get('val_idx', 0)]):.2f}"
+                    else:
+                        polygon_len_edit_text = f"{float(polygon_edge_lengths[zone.get('val_idx', 0)]):.2f}"
+                    sidebar_handled = True
+                    break
+                if zone["type"] == "poly_len_save":
+                    save_all_annotations_to_json(
+                        video_path, saved_tracks, markers, polygon_points,
+                        polygon_edge_lengths=polygon_edge_lengths,
+                        polygon_diagonal_lengths=polygon_diag_lengths)
+                    print("[polygon] edge lengths saved")
+                    sidebar_handled = True
+                    break
+                if zone["type"] == "poly_save_all_proj":
+                    if polygon_confirmed and polygon_points and len(polygon_points) >= 4:
+                        polygon_edge_lengths_valid = (polygon_edge_lengths and 
+                                                      all(x > 0 for x in polygon_edge_lengths[:4]))
+                        polygon_diag_lengths_valid = (polygon_diag_lengths and 
+                                                      all(x > 0 for x in polygon_diag_lengths[:2]))
+                        if polygon_edge_lengths_valid and polygon_diag_lengths_valid:
+                            success = apply_projections_to_all_tracks(
+                                video_path, saved_tracks, polygon_points,
+                                polygon_edge_lengths,
+                                polygon_diag_lengths,
+                                projection_rotation_deg,
+                                projection_flip,
+                                projection_reflect_h,
+                                projection_reflect_v)
+                            if success:
+                                print("[polygon] all track projections saved")
+                            sidebar_handled = True
+                        else:
+                            print("[polygon] invalid edge/diagonal lengths")
+                            sidebar_handled = True
+                    else:
+                        print("[polygon] polygon not confirmed or incomplete")
+                        sidebar_handled = True
+                    break
+            if sidebar_handled:
+                continue
+
             total_pages = max(1, (len(saved_tracks) + TRACKS_PER_PAGE - 1) // TRACKS_PER_PAGE)
             for zone in _layout.get("track_list_zones", []):
                 if not (zone["y1"] <= scy <= zone["y2"]):
@@ -1475,12 +2162,24 @@ def main():
                         # shift previewed_idxs: remove deleted, decrement those above
                         previewed_idxs = {(i if i < idx else i - 1)
                                           for i in previewed_idxs if i != idx}
+                        total_pages_after = max(1, (len(saved_tracks) + TRACKS_PER_PAGE - 1)
+                                                // TRACKS_PER_PAGE)
+                        track_list_page = min(track_list_page, total_pages_after - 1)
+                        save_all_annotations_to_json(
+                            video_path, saved_tracks, markers, polygon_points,
+                            polygon_edge_lengths=polygon_edge_lengths,
+                            polygon_diagonal_lengths=polygon_diag_lengths)
+                        print(f"[delete] removed saved track #{idx + 1}")
                     break
                 elif ztype == "delete_marker":
                     idx = zone["idx"]
                     if 0 <= idx < len(markers):
                         del markers[idx]
-                        save_markers_to_json(video_path, markers, polygon_points)
+                        save_all_annotations_to_json(
+                            video_path, saved_tracks, markers, polygon_points,
+                            polygon_edge_lengths=polygon_edge_lengths,
+                            polygon_diagonal_lengths=polygon_diag_lengths)
+                        print(f"[delete] removed marker #{idx + 1}")
                     break
                 elif ztype == "show_all":
                     previewed_idxs = set(range(len(saved_tracks)))
@@ -1672,6 +2371,29 @@ def main():
         if key != -1:
             key_ch = key & 0xFF
 
+            if polygon_len_edit_idx is not None:
+                if key_ch in KEY_ENTER:
+                    try:
+                        v = float(polygon_len_edit_text)
+                        if polygon_len_edit_idx < 4:
+                            polygon_edge_lengths[polygon_len_edit_idx] = max(0.0, v)
+                        else:
+                            polygon_diag_lengths[polygon_len_edit_idx - 4] = max(0.0, v)
+                    except Exception:
+                        pass
+                    polygon_len_edit_idx = None
+                    polygon_len_edit_text = ""
+                elif key_ch in KEY_BKSP:
+                    polygon_len_edit_text = polygon_len_edit_text[:-1]
+                elif key_ch == 27:
+                    polygon_len_edit_idx = None
+                    polygon_len_edit_text = ""
+                elif ord('0') <= key_ch <= ord('9'):
+                    polygon_len_edit_text += chr(key_ch)
+                elif key_ch == ord('.') and '.' not in polygon_len_edit_text:
+                    polygon_len_edit_text += "."
+                continue
+
             if key_ch in (ord('q'), ord('Q'), 27):    # Q / Esc
                 break
 
@@ -1682,7 +2404,18 @@ def main():
                 elif key_ch in KEY_ENTER:
                     if len(polygon_points) == 4:
                         polygon_confirmed = True
-                        save_markers_to_json(video_path, markers, polygon_points)
+                        if not any(v > 0 for v in polygon_edge_lengths):
+                            polygon_edge_lengths = _polygon_edge_lengths_from_points(polygon_points)
+                        if not any(v > 0 for v in polygon_diag_lengths):
+                            p = np.array(polygon_points, dtype=np.float32)
+                            polygon_diag_lengths = [
+                                float(np.hypot(*(p[2] - p[0]))),
+                                float(np.hypot(*(p[3] - p[1]))),
+                            ]
+                        save_all_annotations_to_json(
+                            video_path, saved_tracks, markers, polygon_points,
+                            polygon_edge_lengths=polygon_edge_lengths,
+                            polygon_diagonal_lengths=polygon_diag_lengths)
                         print("[setup] crosswalk polygon confirmed")
                     else:
                         print("[setup] need exactly 4 points before confirm")
@@ -1693,10 +2426,32 @@ def main():
                 mlabel = f"M{marker_counter}"
                 markers.append({"label": mlabel, "frame": current_frame})
                 markers.sort(key=lambda mk: mk["frame"])
-                save_markers_to_json(video_path, markers, polygon_points)
+                save_all_annotations_to_json(
+                    video_path, saved_tracks, markers, polygon_points,
+                    polygon_edge_lengths=polygon_edge_lengths,
+                    polygon_diagonal_lengths=polygon_diag_lengths)
                 print(f"[marker] added {mlabel} at frame {current_frame}")
 
-            elif key_ch in (ord('v'), ord('V')):       # V – manual vehicle-pos mode
+            elif key_ch in (ord('p'), ord('P')):
+                show_projection_overlay = not show_projection_overlay
+
+            elif key_ch in (ord('o'), ord('O')):
+                if show_projection_overlay:
+                    projection_rotation_deg = (projection_rotation_deg + 7.5) % 360.0
+
+            elif key_ch in (ord('f'), ord('F')):
+                if show_projection_overlay:
+                    projection_flip = not projection_flip
+
+            elif key_ch in (ord('h'), ord('H')):
+                if show_projection_overlay:
+                    projection_reflect_h = not projection_reflect_h
+
+            elif key_ch == ord('v'):
+                if show_projection_overlay:
+                    projection_reflect_v = not projection_reflect_v
+
+            elif key_ch == ord('V'):       # V – manual vehicle-pos mode
                 last_states_per_mode[track_mode] = dict(track_states)
                 track_mode = "vehicle-pos"
                 track_states = dict(last_states_per_mode.get(
@@ -1726,7 +2481,13 @@ def main():
                     interpolate_track_history(track_history)
                     _apply_polygon_to_history(track_history, polygon_points)
                     track_dict = save_track_to_json(
-                        video_path, track_history, fps, markers, polygon_points)
+                        video_path, track_history, fps, markers, polygon_points,
+                        polygon_edge_lengths=polygon_edge_lengths,
+                        polygon_diagonal_lengths=polygon_diag_lengths,
+                        projection_rot_deg=projection_rotation_deg,
+                        projection_flip=projection_flip,
+                        projection_reflect_h=projection_reflect_h,
+                        projection_reflect_v=projection_reflect_v)
                     track_dict["_frame_lookup"] = build_frame_lookup(track_dict)
                     track_dict["_person_path_pts"] = build_person_path_points(track_dict)
                     saved_tracks.append(track_dict)
