@@ -6,6 +6,7 @@ import json
 import datetime
 import numpy as np
 from ultralytics import YOLO
+from scipy.signal import savgol_filter
 
 WINDOW_NAME     = "Video Player"
 SIDEBAR_W       = 220            # left sidebar width (pixels)
@@ -299,6 +300,62 @@ def build_person_path_points(track_dict):
     return pts
 
 
+def _smooth_frame_path_points(frame_points):
+    """Smooth a sorted list of (frame_num, x, y) points in frame space."""
+    if savgol_filter is None or len(frame_points) < 3:
+        return list(frame_points)
+
+    sorted_points = sorted(frame_points, key=lambda t: t[0])
+    segments = []
+    segment = [sorted_points[0]]
+    for point in sorted_points[1:]:
+        if point[0] == segment[-1][0] + 1:
+            segment.append(point)
+        else:
+            segments.append(segment)
+            segment = [point]
+    segments.append(segment)
+
+    smoothed_points = []
+    for segment in segments:
+        if len(segment) < 3:
+            smoothed_points.extend(segment)
+            continue
+        coords = [(point[1], point[2]) for point in segment]
+        smoothed_coords = _smooth_xy_points_savgol(coords)
+        smoothed_points.extend(
+            (point[0], float(smooth[0]), float(smooth[1]))
+            for point, smooth in zip(segment, smoothed_coords)
+        )
+    return smoothed_points
+
+
+def _build_frame_point_lookup(track_dict, key, fallback_key=None):
+    lookup = {}
+    for frame_data in track_dict.get("frames", []):
+        point = frame_data.get(key)
+        if point is None and fallback_key is not None:
+            point = frame_data.get(fallback_key)
+        if point is None or len(point) < 2:
+            continue
+        lookup[int(frame_data["frame_num"])] = [float(point[0]), float(point[1])]
+    return lookup
+
+
+def _finalize_saved_track(track_dict):
+    """Attach in-memory caches used by the live UI to a saved track dict."""
+    track_dict["_frame_lookup"] = build_frame_lookup(track_dict)
+    track_dict["_person_path_pts"] = build_person_path_points(track_dict)
+    track_dict["_smooth_person_path_pts"] = _smooth_frame_path_points(
+        track_dict["_person_path_pts"]
+    )
+    track_dict["_projected_point_lookup"] = _build_frame_point_lookup(track_dict, "projected_point")
+    track_dict["_smooth_projected_point_lookup"] = _build_frame_point_lookup(
+        track_dict, "smooth_projected_point", fallback_key="projected_point"
+    )
+    return track_dict
+
+
 def _vehicle_line_len_from_box(box, frame_h):
     x1, y1, x2, y2 = box
     span = abs(int(y2) - int(y1))
@@ -352,8 +409,7 @@ def _refresh_saved_track_polygon(track_dict, polygon_points):
         if poly_key in updated_states:
             frame_states[poly_key] = updated_states[poly_key]
         frame_data["states"] = frame_states
-    track_dict["_frame_lookup"] = build_frame_lookup(track_dict)
-    track_dict["_person_path_pts"] = build_person_path_points(track_dict)
+    _finalize_saved_track(track_dict)
 
 
 def _polygon_edge_lengths_from_points(polygon_points):
@@ -554,14 +610,15 @@ def _compute_track_projection(track_dict, polygon_points, edge_lengths, diag_len
 
 
 def _compute_projected_frame_points(frame_lookup, polygon_points, edge_lengths, diag_lengths,
-                                    rot_deg, flip, reflect_h, reflect_v):
-    """Project per-frame person/vehicle-pos coordinates into the normalized polygon space.
+                                    rot_deg, flip, reflect_h, reflect_v,
+                                    smooth_trajectories=False):
+    """Project raw and smoothed frame-space paths into the normalized polygon space.
 
-    Returns (projected_polygon, projected_points_by_frame) where projected_points_by_frame
-    maps frame number -> [x, y] in the projected coordinate system.
+    Returns (projected_polygon, projected_points_by_frame, smooth_projected_points_by_frame).
+    Both point maps are keyed by frame number and store [x, y] in projected space.
     """
     if not polygon_points or len(polygon_points) < 4:
-        return None, {}
+        return None, {}, {}
 
     geom = _polygon_projection_geometry(
         edge_lengths,
@@ -572,32 +629,43 @@ def _compute_projected_frame_points(frame_lookup, polygon_points, edge_lengths, 
         reflect_v=reflect_v,
     )
     if geom is None:
-        return None, {}
+        return None, {}, {}
 
     src = np.array(polygon_points[:4], dtype=np.float32)
     dst = geom.astype(np.float32)
     try:
         hmat = cv2.getPerspectiveTransform(src, dst)
     except Exception:
-        return None, {}
+        return None, {}, {}
 
-    projected_points = {}
+    raw_points = []
     for fn in sorted(frame_lookup.keys()):
         x1, y1, x2, y2, _, mode, _ = frame_lookup[fn]
         if mode not in ("person", "vehicle-pos"):
             continue
         px = float(x1) if mode == "vehicle-pos" else float(x1 + x2) / 2.0
-        arr = np.array([[(px), float(y2)]], dtype=np.float32).reshape(-1, 1, 2)
-        proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)[0]
-        projected_points[int(fn)] = [float(proj[0]), float(proj[1])]
+        raw_points.append((int(fn), px, float(y2)))
 
-    return [tuple(map(float, p)) for p in dst], projected_points
+    smooth_points = _smooth_frame_path_points(raw_points)
+
+    def _project_path(path_points):
+        projected_points = {}
+        for fn, px, py in path_points:
+            arr = np.array([[(px), float(py)]], dtype=np.float32).reshape(-1, 1, 2)
+            proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)[0]
+            projected_points[int(fn)] = [float(proj[0]), float(proj[1])]
+        return projected_points
+
+    raw_projected_points = _project_path(raw_points)
+    smooth_projected_points = _project_path(smooth_points)
+
+    return [tuple(map(float, p)) for p in dst], raw_projected_points, smooth_projected_points
 
 
 def _compute_projection_overlay_data(polygon_points, edge_lengths, diag_lengths, rot_deg,
                                      flip, reflect_h, reflect_v,
                                      track_history, current_frame, saved_tracks,
-                                     previewed_idxs):
+                                     previewed_idxs, smooth_trajectories=False):
     geom = _polygon_projection_geometry(
         edge_lengths,
         diag_lengths,
@@ -616,12 +684,37 @@ def _compute_projection_overlay_data(polygon_points, edge_lengths, diag_lengths,
         return None
 
     out_traces = []
-    traces = _project_person_midpoints(
-        track_history, current_frame, saved_tracks, previewed_idxs=previewed_idxs)
-    for pts in traces:
+    live_traces = _project_person_midpoints(track_history, current_frame, [], previewed_idxs=None)
+    for pts in live_traces:
+        if smooth_trajectories:
+            pts = _smooth_xy_points_savgol(pts)
         arr = np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
         proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)
         out_traces.append([tuple(map(float, p)) for p in proj])
+
+    for i in sorted(previewed_idxs):
+        if i < 0 or i >= len(saved_tracks):
+            continue
+        track = saved_tracks[i]
+        if current_frame not in track.get("_frame_lookup", {}):
+            continue
+        frame_lookup = track.get("_frame_lookup", {})
+        _, _, _, _, _, mode, _ = frame_lookup[current_frame]
+        if mode not in ("person", "vehicle-pos"):
+            continue
+        path_key = "_smooth_person_path_pts" if smooth_trajectories else "_person_path_pts"
+        frame_pts = [
+            (float(px), float(py))
+            for (fn, px, py) in track.get(path_key, [])
+            if fn <= current_frame
+        ]
+        pts = []
+        if frame_pts:
+            arr = np.array(frame_pts, dtype=np.float32).reshape(-1, 1, 2)
+            proj = cv2.perspectiveTransform(arr, hmat).reshape(-1, 2)
+            pts = [tuple(map(float, p)) for p in proj]
+        if pts:
+            out_traces.append(pts)
 
     return {
         "poly": [tuple(map(float, p)) for p in dst],
@@ -645,21 +738,80 @@ def _serialize_track_dict(track_dict):
     return out
 
 
+def _read_projection_settings(raw_doc):
+    """Read projection transform settings from JSON with backward-compatible fallbacks."""
+    settings = {}
+    if isinstance(raw_doc, dict):
+        settings = raw_doc.get("projection_settings", {}) or {}
+
+    def _pick_bool(new_key, legacy_key, default):
+        if isinstance(settings, dict) and new_key in settings:
+            return bool(settings.get(new_key))
+        if isinstance(raw_doc, dict) and legacy_key in raw_doc:
+            return bool(raw_doc.get(legacy_key))
+        return bool(default)
+
+    def _pick_float(new_key, legacy_key, default):
+        if isinstance(settings, dict) and new_key in settings:
+            try:
+                return float(settings.get(new_key))
+            except Exception:
+                pass
+        if isinstance(raw_doc, dict) and legacy_key in raw_doc:
+            try:
+                return float(raw_doc.get(legacy_key))
+            except Exception:
+                pass
+        return float(default)
+
+    return {
+        "rotation_degrees": _pick_float("rotation_degrees", "projection_rotation_deg", 0.0),
+        "flip": _pick_bool("flip", "projection_flip", False),
+        "reflect_horizontal": _pick_bool("reflect_horizontal", "projection_reflect_h", False),
+        "reflect_vertical": _pick_bool("reflect_vertical", "projection_reflect_v", False),
+    }
+
+
 def save_all_annotations_to_json(video_path, saved_tracks, markers, polygon=None,
                                  polygon_edge_lengths=None,
                                  polygon_diagonal_lengths=None,
-                                 projected_polygon=None):
+                                 projected_polygon=None,
+                                 projection_rot_deg=None,
+                                 projection_flip=None,
+                                 projection_reflect_h=None,
+                                 projection_reflect_v=None):
     outpath = _markers_path(video_path)
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
     old_projected_polygon = []
+    old_projection_settings = _read_projection_settings({})
     if os.path.isfile(outpath):
         try:
             with open(outpath, "r") as f:
                 _raw = json.load(f)
             if isinstance(_raw, dict):
                 old_projected_polygon = _raw.get("projected_polygon", [])
+                old_projection_settings = _read_projection_settings(_raw)
         except Exception:
             old_projected_polygon = []
+            old_projection_settings = _read_projection_settings({})
+    projection_settings = {
+        "rotation_degrees": (
+            float(projection_rot_deg)
+            if projection_rot_deg is not None else float(old_projection_settings.get("rotation_degrees", 0.0))
+        ),
+        "flip": (
+            bool(projection_flip)
+            if projection_flip is not None else bool(old_projection_settings.get("flip", False))
+        ),
+        "reflect_horizontal": (
+            bool(projection_reflect_h)
+            if projection_reflect_h is not None else bool(old_projection_settings.get("reflect_horizontal", False))
+        ),
+        "reflect_vertical": (
+            bool(projection_reflect_v)
+            if projection_reflect_v is not None else bool(old_projection_settings.get("reflect_vertical", False))
+        ),
+    }
     out_doc = {
         "tracks": [_serialize_track_dict(track) for track in saved_tracks],
         "markers": markers,
@@ -667,6 +819,7 @@ def save_all_annotations_to_json(video_path, saved_tracks, markers, polygon=None
         "polygon_edge_lengths": polygon_edge_lengths or [],
         "polygon_diagonal_lengths": polygon_diagonal_lengths or [],
         "projected_polygon": projected_polygon if projected_polygon is not None else old_projected_polygon,
+        "projection_settings": projection_settings,
     }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
@@ -694,7 +847,51 @@ def draw_smooth_polyline(canvas, frame_pts, x_off, y_off, scale, color, thicknes
     cv2.polylines(canvas, [arr.astype(np.int32)], False, color, thickness, cv2.LINE_AA)
 
 
-def _draw_projection_overlay(canvas, overlay_data, edge_colors, alpha=0.75):
+def _savgol_window(base_window, n_points):
+    """Return valid odd window length for savgol_filter or 0 when unavailable."""
+    if n_points <= 2:
+        return 0
+    w = min(int(base_window), int(n_points))
+    if w < 3:
+        return 0
+    if w % 2 == 0:
+        w -= 1
+    return w if w >= 3 else 0
+
+
+def _smooth_xy_points_savgol(points):
+    """Smooth list of (x, y) points using Savitzky-Golay on each axis."""
+    if savgol_filter is None or len(points) < 3:
+        return list(points)
+    arr = np.array(points, dtype=np.float32)
+    wx = _savgol_window(50, len(arr))
+    wy = _savgol_window(50, len(arr))
+    if wx == 0 or wy == 0:
+        return list(points)
+    try:
+        sx = savgol_filter(arr[:, 0], window_length=wx, polyorder=1, delta=10)
+        sy = savgol_filter(arr[:, 1], window_length=wy, polyorder=1, delta=10)
+        out = np.stack([sx, sy], axis=1)
+        return [tuple(map(float, p)) for p in out]
+    except Exception:
+        return list(points)
+
+
+def _draw_trajectory_polyline(canvas, frame_pts, x_off, y_off, scale, color,
+                              smooth_enabled=True, thickness=2):
+    """Draw trajectory line in frame space from precomputed points."""
+    if len(frame_pts) < 2:
+        return
+    draw_pts = list(frame_pts)
+    arr = np.array([
+        [x_off + p[0] * scale, y_off + p[1] * scale]
+        for p in draw_pts
+    ], dtype=np.float32)
+    cv2.polylines(canvas, [arr.astype(np.int32)], False, color, thickness, cv2.LINE_AA)
+
+
+def _draw_projection_overlay(canvas, overlay_data, edge_colors, alpha=0.75,
+                             smooth_trajectories=False):
     if overlay_data is None:
         return
     poly = overlay_data.get("poly", [])
@@ -832,6 +1029,7 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         canvas_meta = {}
     if preview_boxes is None:
         preview_boxes = []
+    smooth_trajectories = bool(canvas_meta.get("smooth_trajectories", False))
     canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
 
     video_area_h = int(screen_h * 0.90)
@@ -1113,6 +1311,7 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         ("[BKSP] clear",         (200, 80, 80)),
         ("[A+BKSP] del before",  (200, 140, 60)),
         ("[S+A+BKSP] del after", (200, 140, 60)),
+        ("[S] smooth traj",      (120, 220, 190)),
         ("[P] projection",       (160, 210, 255)),
         ("[O] rotate projection",(160, 210, 255)),
         ("[F] flip solution",    (160, 210, 255)),
@@ -1262,7 +1461,9 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
         sx2 = int(x_off + x2 * scale)
         sy2 = int(y_off + y2 * scale)
         if traj_points:
-            draw_smooth_polyline(canvas, traj_points, x_off, y_off, scale, col, thickness=2)
+            _draw_trajectory_polyline(
+                canvas, traj_points, x_off, y_off, scale, col,
+                smooth_enabled=smooth_trajectories, thickness=2)
         if pmode == "vehicle-pos":
             _draw_vehicle_pos_line(sx1, sy1, sy2, col, lbl, ann_lines)
         else:
@@ -1310,6 +1511,7 @@ def build_canvas(frame, screen_w, screen_h, current_frame, total_frames,
             canvas_meta.get("projection_overlay_data"),
             POLY_EDGE_COLORS,
             alpha=0.78,
+            smooth_trajectories=smooth_trajectories,
         )
 
     # --- timeline ---
@@ -1416,22 +1618,26 @@ def save_markers_to_json(video_path, markers, polygon=None):
             old_polygon = _raw.get("polygon", [])
             old_lengths = _raw.get("polygon_edge_lengths", [])
             old_diags = _raw.get("polygon_diagonal_lengths", [])
+            old_projection_settings = _read_projection_settings(_raw)
         else:
             all_tracks = _raw
             old_polygon = []
             old_lengths = []
             old_diags = []
+            old_projection_settings = _read_projection_settings({})
     else:
         all_tracks = []
         old_polygon = []
         old_lengths = []
         old_diags = []
+        old_projection_settings = _read_projection_settings({})
     out_doc = {
         "tracks": all_tracks,
         "markers": markers,
         "polygon": polygon if polygon is not None else old_polygon,
         "polygon_edge_lengths": old_lengths,
         "polygon_diagonal_lengths": old_diags,
+        "projection_settings": old_projection_settings,
     }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
@@ -1440,7 +1646,8 @@ def save_markers_to_json(video_path, markers, polygon=None):
 def save_track_to_json(video_path, track_history, fps, markers=None, polygon=None,
                        polygon_edge_lengths=None, polygon_diagonal_lengths=None,
                        projection_rot_deg=None, projection_flip=None, 
-                       projection_reflect_h=None, projection_reflect_v=None):
+                       projection_reflect_h=None, projection_reflect_v=None,
+                       smooth_trajectories=False):
     """Append the current track (with per-frame mode+states) to the JSON file.
     Saves markers alongside tracks. Optionally includes projected track data in meters.
     Returns the saved track dict.
@@ -1457,18 +1664,21 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
             old_lengths = _raw.get("polygon_edge_lengths", [])
             old_diags = _raw.get("polygon_diagonal_lengths", [])
             old_projected_polygon = _raw.get("projected_polygon", [])
+            old_projection_settings = _read_projection_settings(_raw)
         else:
             all_tracks = _raw   # migrate old format
             old_polygon = []
             old_lengths = []
             old_diags = []
             old_projected_polygon = []
+            old_projection_settings = _read_projection_settings({})
     else:
         all_tracks = []
         old_polygon = []
         old_lengths = []
         old_diags = []
         old_projected_polygon = []
+        old_projection_settings = _read_projection_settings({})
 
     frames_data = []
     for frame_num in sorted(track_history.keys()):
@@ -1524,7 +1734,7 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
             x1, y1, x2, y2, label, fmode, fstates = track_history[fn]
             frame_lookup[fn] = (x1, y1, x2, y2, label, fmode, fstates)
 
-        projected_polygon, projected_points = _compute_projected_frame_points(
+        projected_polygon, projected_points, smooth_projected_points = _compute_projected_frame_points(
             frame_lookup,
             polygon,
             polygon_edge_lengths[:4],
@@ -1534,11 +1744,17 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
             projection_reflect_h,
             projection_reflect_v,
         )
-        if projected_points:
+        if projected_points or smooth_projected_points:
             for frame_data in frames_data:
-                proj_point = projected_points.get(frame_data["frame_num"])
+                fn = frame_data["frame_num"]
+                proj_point = projected_points.get(fn)
                 if proj_point is not None:
                     frame_data["projected_point"] = proj_point
+                smooth_proj_point = smooth_projected_points.get(fn)
+                if smooth_proj_point is not None:
+                    frame_data["smooth_projected_point"] = smooth_proj_point
+
+    track_dict = _finalize_saved_track(track_dict)
     
     all_tracks.append(track_dict)
 
@@ -1555,6 +1771,24 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
             if polygon_diagonal_lengths is not None else old_diags
         ),
         "projected_polygon": projected_polygon if projected_polygon is not None else old_projected_polygon,
+        "projection_settings": {
+            "rotation_degrees": (
+                float(projection_rot_deg)
+                if projection_rot_deg is not None else float(old_projection_settings.get("rotation_degrees", 0.0))
+            ),
+            "flip": (
+                bool(projection_flip)
+                if projection_flip is not None else bool(old_projection_settings.get("flip", False))
+            ),
+            "reflect_horizontal": (
+                bool(projection_reflect_h)
+                if projection_reflect_h is not None else bool(old_projection_settings.get("reflect_horizontal", False))
+            ),
+            "reflect_vertical": (
+                bool(projection_reflect_v)
+                if projection_reflect_v is not None else bool(old_projection_settings.get("reflect_vertical", False))
+            ),
+        },
     }
     with open(outpath, "w") as f:
         json.dump(out_doc, f, indent=2)
@@ -1564,7 +1798,8 @@ def save_track_to_json(video_path, track_history, fps, markers=None, polygon=Non
 
 
 def apply_projections_to_all_tracks(video_path, saved_tracks, polygon, polygon_edge_lengths,
-                                    polygon_diagonal_lengths, rot_deg, flip, reflect_h, reflect_v):
+                                    polygon_diagonal_lengths, rot_deg, flip, reflect_h, reflect_v,
+                                    smooth_trajectories=False):
     """Apply/update projections for all saved tracks and persist to JSON.
     
     Retroactively computes projected track data for all saved tracks using current projection
@@ -1603,7 +1838,7 @@ def apply_projections_to_all_tracks(video_path, saved_tracks, polygon, polygon_e
             states = fd.get("states", {})
             frame_lookup[fn] = (x1, y1, x2, y2, label, mode, states)
 
-        projected_polygon, projected_points = _compute_projected_frame_points(
+        projected_polygon, projected_points, smooth_projected_points = _compute_projected_frame_points(
             frame_lookup,
             polygon,
             polygon_edge_lengths[:4],
@@ -1614,19 +1849,35 @@ def apply_projections_to_all_tracks(video_path, saved_tracks, polygon, polygon_e
             reflect_v,
         )
 
-        if projected_points:
+        for fd in track.get("frames", []):
+            if "projected_point" in fd:
+                del fd["projected_point"]
+            if "smooth_projected_point" in fd:
+                del fd["smooth_projected_point"]
+        if projected_points or smooth_projected_points:
             for fd in track.get("frames", []):
-                proj_point = projected_points.get(fd["frame_num"])
+                fn = fd["frame_num"]
+                proj_point = projected_points.get(fn)
                 if proj_point is not None:
                     fd["projected_point"] = proj_point
+                smooth_proj_point = smooth_projected_points.get(fn)
+                if smooth_proj_point is not None:
+                    fd["smooth_projected_point"] = smooth_proj_point
             updated_count += 1
 
         if "projected_track" in track:
             del track["projected_track"]
+        _finalize_saved_track(track)
     
     # Save back to JSON
     try:
         doc["projected_polygon"] = projected_polygon if projected_polygon is not None else doc.get("projected_polygon", [])
+        doc["projection_settings"] = {
+            "rotation_degrees": float(rot_deg),
+            "flip": bool(flip),
+            "reflect_horizontal": bool(reflect_h),
+            "reflect_vertical": bool(reflect_v),
+        }
         with open(outpath, "w") as f:
             json.dump(doc, f, indent=2)
         print(f"[proj] Applied projections to {updated_count}/{len(all_tracks)} tracks → {outpath}")
@@ -1817,6 +2068,7 @@ def main():
     projection_flip = False
     projection_reflect_h = False
     projection_reflect_v = False
+    smooth_trajectories = False
     video_name      = os.path.basename(video_path)
 
     # Load existing tracks from JSON on startup
@@ -1832,16 +2084,16 @@ def main():
                 _polygon_raw = _loaded.get("polygon", [])
                 _edge_raw    = _loaded.get("polygon_edge_lengths", [])
                 _diag_raw    = _loaded.get("polygon_diagonal_lengths", [])
+                _proj_settings = _read_projection_settings(_loaded)
             else:
                 _tracks_raw  = _loaded
                 _markers_raw = []
                 _polygon_raw = []
                 _edge_raw    = []
                 _diag_raw    = []
+                _proj_settings = _read_projection_settings({})
             for _td in _tracks_raw:
-                _td["_frame_lookup"] = build_frame_lookup(_td)
-                _td["_person_path_pts"] = build_person_path_points(_td)
-                saved_tracks.append(_td)
+                saved_tracks.append(_finalize_saved_track(_td))
             for _m in _markers_raw:
                 markers.append(_m)
                 marker_counter = max(marker_counter,
@@ -1872,6 +2124,10 @@ def main():
                     float(np.hypot(*(p[2] - p[0]))),
                     float(np.hypot(*(p[3] - p[1]))),
                 ]
+            projection_rotation_deg = float(_proj_settings.get("rotation_degrees", 0.0))
+            projection_flip = bool(_proj_settings.get("flip", False))
+            projection_reflect_h = bool(_proj_settings.get("reflect_horizontal", False))
+            projection_reflect_v = bool(_proj_settings.get("reflect_vertical", False))
             print(f"[load] {len(saved_tracks)} tracks, {len(markers)} markers loaded")
             if polygon_confirmed:
                 print("[load] crosswalk polygon loaded")
@@ -1918,7 +2174,8 @@ def main():
                                 ann_lines.append((str(pstates[pcat]),
                                                   entry[2] if len(entry) > 2 else 'per_frame'))
                     if pmode in ("person", "vehicle-pos"):
-                        path_all = saved_tracks[pidx].get("_person_path_pts", [])
+                        path_key = "_smooth_person_path_pts" if smooth_trajectories else "_person_path_pts"
+                        path_all = saved_tracks[pidx].get(path_key, [])
                         traj_points = [(mx, my) for (fn, mx, my) in path_all if fn <= current_frame]
                     preview_boxes.append((px1, py1, px2, py2, plbl, pcol, ann_lines, traj_points, pmode))
 
@@ -1962,6 +2219,7 @@ def main():
                 current_frame,
                 saved_tracks,
                 previewed_idxs,
+                smooth_trajectories=smooth_trajectories,
             )
 
         canvas = build_canvas(frame, screen_w, screen_h,
@@ -1988,6 +2246,7 @@ def main():
                                "polygon_len_edit_text": polygon_len_edit_text,
                                "polygon_drag_idx": drag_idx,
                                "polygon_setup":  not polygon_confirmed,
+                               "smooth_trajectories": smooth_trajectories,
                                "show_projection_overlay": show_projection_overlay,
                                "projection_overlay_data": projection_overlay_data})
         cv2.imshow(WINDOW_NAME, canvas)
@@ -2047,7 +2306,11 @@ def main():
                     save_all_annotations_to_json(
                         video_path, saved_tracks, markers, polygon_points,
                         polygon_edge_lengths=polygon_edge_lengths,
-                        polygon_diagonal_lengths=polygon_diag_lengths)
+                        polygon_diagonal_lengths=polygon_diag_lengths,
+                        projection_rot_deg=projection_rotation_deg,
+                        projection_flip=projection_flip,
+                        projection_reflect_h=projection_reflect_h,
+                        projection_reflect_v=projection_reflect_v)
                 print(f"[polygon] moved point {drag_idx + 1}/{len(polygon_points)}")
             continue
 
@@ -2106,7 +2369,11 @@ def main():
                     save_all_annotations_to_json(
                         video_path, saved_tracks, markers, polygon_points,
                         polygon_edge_lengths=polygon_edge_lengths,
-                        polygon_diagonal_lengths=polygon_diag_lengths)
+                        polygon_diagonal_lengths=polygon_diag_lengths,
+                        projection_rot_deg=projection_rotation_deg,
+                        projection_flip=projection_flip,
+                        projection_reflect_h=projection_reflect_h,
+                        projection_reflect_v=projection_reflect_v)
                     print("[polygon] edge lengths saved")
                     sidebar_handled = True
                     break
@@ -2124,9 +2391,11 @@ def main():
                                 projection_rotation_deg,
                                 projection_flip,
                                 projection_reflect_h,
-                                projection_reflect_v)
+                                projection_reflect_v,
+                                smooth_trajectories=smooth_trajectories)
                             if success:
-                                print("[polygon] all track projections saved")
+                                mode_txt = "smoothed" if smooth_trajectories else "raw"
+                                print(f"[polygon] all track projections saved ({mode_txt})")
                             sidebar_handled = True
                         else:
                             print("[polygon] invalid edge/diagonal lengths")
@@ -2168,7 +2437,11 @@ def main():
                         save_all_annotations_to_json(
                             video_path, saved_tracks, markers, polygon_points,
                             polygon_edge_lengths=polygon_edge_lengths,
-                            polygon_diagonal_lengths=polygon_diag_lengths)
+                            polygon_diagonal_lengths=polygon_diag_lengths,
+                            projection_rot_deg=projection_rotation_deg,
+                            projection_flip=projection_flip,
+                            projection_reflect_h=projection_reflect_h,
+                            projection_reflect_v=projection_reflect_v)
                         print(f"[delete] removed saved track #{idx + 1}")
                     break
                 elif ztype == "delete_marker":
@@ -2178,7 +2451,11 @@ def main():
                         save_all_annotations_to_json(
                             video_path, saved_tracks, markers, polygon_points,
                             polygon_edge_lengths=polygon_edge_lengths,
-                            polygon_diagonal_lengths=polygon_diag_lengths)
+                            polygon_diagonal_lengths=polygon_diag_lengths,
+                            projection_rot_deg=projection_rotation_deg,
+                            projection_flip=projection_flip,
+                            projection_reflect_h=projection_reflect_h,
+                            projection_reflect_v=projection_reflect_v)
                         print(f"[delete] removed marker #{idx + 1}")
                     break
                 elif ztype == "show_all":
@@ -2415,7 +2692,11 @@ def main():
                         save_all_annotations_to_json(
                             video_path, saved_tracks, markers, polygon_points,
                             polygon_edge_lengths=polygon_edge_lengths,
-                            polygon_diagonal_lengths=polygon_diag_lengths)
+                            polygon_diagonal_lengths=polygon_diag_lengths,
+                            projection_rot_deg=projection_rotation_deg,
+                            projection_flip=projection_flip,
+                            projection_reflect_h=projection_reflect_h,
+                            projection_reflect_v=projection_reflect_v)
                         print("[setup] crosswalk polygon confirmed")
                     else:
                         print("[setup] need exactly 4 points before confirm")
@@ -2429,27 +2710,70 @@ def main():
                 save_all_annotations_to_json(
                     video_path, saved_tracks, markers, polygon_points,
                     polygon_edge_lengths=polygon_edge_lengths,
-                    polygon_diagonal_lengths=polygon_diag_lengths)
+                    polygon_diagonal_lengths=polygon_diag_lengths,
+                    projection_rot_deg=projection_rotation_deg,
+                    projection_flip=projection_flip,
+                    projection_reflect_h=projection_reflect_h,
+                    projection_reflect_v=projection_reflect_v)
                 print(f"[marker] added {mlabel} at frame {current_frame}")
 
             elif key_ch in (ord('p'), ord('P')):
                 show_projection_overlay = not show_projection_overlay
 
+            elif key_ch in (ord('s'), ord('S')):
+                smooth_trajectories = not smooth_trajectories
+                mode_txt = "ON" if smooth_trajectories else "OFF"
+                if smooth_trajectories and savgol_filter is None:
+                    print("[smooth] scipy not available, using raw trajectories")
+                print(f"[smooth] trajectory smoothing {mode_txt}")
+
             elif key_ch in (ord('o'), ord('O')):
                 if show_projection_overlay:
                     projection_rotation_deg = (projection_rotation_deg + 7.5) % 360.0
+                    save_all_annotations_to_json(
+                        video_path, saved_tracks, markers, polygon_points,
+                        polygon_edge_lengths=polygon_edge_lengths,
+                        polygon_diagonal_lengths=polygon_diag_lengths,
+                        projection_rot_deg=projection_rotation_deg,
+                        projection_flip=projection_flip,
+                        projection_reflect_h=projection_reflect_h,
+                        projection_reflect_v=projection_reflect_v)
 
             elif key_ch in (ord('f'), ord('F')):
                 if show_projection_overlay:
                     projection_flip = not projection_flip
+                    save_all_annotations_to_json(
+                        video_path, saved_tracks, markers, polygon_points,
+                        polygon_edge_lengths=polygon_edge_lengths,
+                        polygon_diagonal_lengths=polygon_diag_lengths,
+                        projection_rot_deg=projection_rotation_deg,
+                        projection_flip=projection_flip,
+                        projection_reflect_h=projection_reflect_h,
+                        projection_reflect_v=projection_reflect_v)
 
             elif key_ch in (ord('h'), ord('H')):
                 if show_projection_overlay:
                     projection_reflect_h = not projection_reflect_h
+                    save_all_annotations_to_json(
+                        video_path, saved_tracks, markers, polygon_points,
+                        polygon_edge_lengths=polygon_edge_lengths,
+                        polygon_diagonal_lengths=polygon_diag_lengths,
+                        projection_rot_deg=projection_rotation_deg,
+                        projection_flip=projection_flip,
+                        projection_reflect_h=projection_reflect_h,
+                        projection_reflect_v=projection_reflect_v)
 
             elif key_ch == ord('v'):
                 if show_projection_overlay:
                     projection_reflect_v = not projection_reflect_v
+                    save_all_annotations_to_json(
+                        video_path, saved_tracks, markers, polygon_points,
+                        polygon_edge_lengths=polygon_edge_lengths,
+                        polygon_diagonal_lengths=polygon_diag_lengths,
+                        projection_rot_deg=projection_rotation_deg,
+                        projection_flip=projection_flip,
+                        projection_reflect_h=projection_reflect_h,
+                        projection_reflect_v=projection_reflect_v)
 
             elif key_ch == ord('V'):       # V – manual vehicle-pos mode
                 last_states_per_mode[track_mode] = dict(track_states)
@@ -2487,7 +2811,8 @@ def main():
                         projection_rot_deg=projection_rotation_deg,
                         projection_flip=projection_flip,
                         projection_reflect_h=projection_reflect_h,
-                        projection_reflect_v=projection_reflect_v)
+                        projection_reflect_v=projection_reflect_v,
+                        smooth_trajectories=smooth_trajectories)
                     track_dict["_frame_lookup"] = build_frame_lookup(track_dict)
                     track_dict["_person_path_pts"] = build_person_path_points(track_dict)
                     saved_tracks.append(track_dict)
